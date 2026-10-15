@@ -7,6 +7,7 @@ import Glibc
 
 enum PeerResponse: Sendable {
     case reply(Int, Data, [String: String] = [:])
+    case gatedReply(Int, Data, PeerGate)
     case stream(Int)
     case stall(Bool)
     case disconnect
@@ -27,13 +28,17 @@ struct PeerCompletion: Sendable {
 
 actor PeerLog {
     private let responses: [PeerResponse]
+    private let responder: (@Sendable (PeerRequest) -> PeerResponse)?
     private(set) var requests: [PeerRequest] = []
     private(set) var completions: [PeerCompletion] = []
     private(set) var stopped = false
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var requestWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
-    init(_ responses: [PeerResponse]) { self.responses = responses }
+    init(_ responses: [PeerResponse], responder: (@Sendable (PeerRequest) -> PeerResponse)? = nil) {
+        self.responses = responses
+        self.responder = responder
+    }
 
     func receive(_ request: PeerRequest) -> PeerResponse {
         let index = requests.count
@@ -41,6 +46,7 @@ actor PeerLog {
         let ready = requestWaiters.filter { $0.0 <= requests.count }
         requestWaiters.removeAll { $0.0 <= requests.count }
         for (_, continuation) in ready { continuation.resume() }
+        if let responder { return responder(request) }
         return index < responses.count ? responses[index] : .reply(200, Data("{}".utf8))
     }
 
@@ -71,7 +77,7 @@ final class LoopbackServer: Sendable {
     private let port: UInt16
     private let worker: Task<Void, Never>
 
-    init(_ responses: [PeerResponse] = []) throws {
+    init(_ responses: [PeerResponse] = [], responder: (@Sendable (PeerRequest) -> PeerResponse)? = nil) throws {
         #if canImport(Darwin)
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         #else
@@ -98,35 +104,39 @@ final class LoopbackServer: Sendable {
         origin = "http://127.0.0.1:\(UInt16(bigEndian: address.sin_port))"
         port = address.sin_port
         listener = descriptor
-        let log = PeerLog(responses)
+        let log = PeerLog(responses, responder: responder)
         self.log = log
         worker = Task.detached {
-            while true {
-                let client: Int32 = await withCheckedContinuation { continuation in
-                    DispatchQueue.global().async {
-                        continuation.resume(returning: accept(descriptor, nil, nil))
+            await withTaskGroup(of: Void.self) { group in
+                while true {
+                    let client: Int32 = await withCheckedContinuation { continuation in
+                        DispatchQueue.global().async {
+                            continuation.resume(returning: accept(descriptor, nil, nil))
+                        }
+                    }
+                    guard client >= 0 else { return }
+                    if await log.stopped { close(client); return }
+                    group.addTask {
+                        #if canImport(Darwin)
+                        var noSignal: Int32 = 1
+                        _ = setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
+                                       socklen_t(MemoryLayout<Int32>.size))
+                        #endif
+                        var receiveTimeout = timeval(tv_sec: 5, tv_usec: 0)
+                        _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout,
+                                       socklen_t(MemoryLayout<timeval>.size))
+                        let request = await withCheckedContinuation { continuation in
+                            DispatchQueue.global().async {
+                                continuation.resume(returning: Self.readRequest(client))
+                            }
+                        }
+                        if let request {
+                            let response = await log.receive(request)
+                            await Self.respond(response, client: client, log: log)
+                        }
+                        close(client)
                     }
                 }
-                guard client >= 0 else { return }
-                if await log.stopped { close(client); return }
-                #if canImport(Darwin)
-                var noSignal: Int32 = 1
-                _ = setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
-                               socklen_t(MemoryLayout<Int32>.size))
-                #endif
-                var receiveTimeout = timeval(tv_sec: 5, tv_usec: 0)
-                _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout,
-                               socklen_t(MemoryLayout<timeval>.size))
-                let request = await withCheckedContinuation { continuation in
-                    DispatchQueue.global().async {
-                        continuation.resume(returning: Self.readRequest(client))
-                    }
-                }
-                if let request {
-                    let response = await log.receive(request)
-                    await Self.respond(response, client: client, log: log)
-                }
-                close(client)
             }
         }
     }
@@ -210,6 +220,10 @@ final class LoopbackServer: Sendable {
             let header = "HTTP/1.1 \(status) Test\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\(extras)\r\n"
             disconnected = !write(Data(header.utf8), to: client) || !write(body, to: client)
             sent = body.count
+        case let .gatedReply(status, body, gate):
+            await gate.wait()
+            await respond(.reply(status, body), client: client, log: log)
+            return
         case let .stream(size):
             // No Content-Length: the client must enforce the limit while receiving real chunks.
             disconnected = !write(Data("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".utf8), to: client)
@@ -248,3 +262,19 @@ final class LoopbackServer: Sendable {
 }
 
 private enum PeerFailure: Error { case socket }
+
+actor PeerGate {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        for waiter in waiters { waiter.resume() }
+        waiters = []
+    }
+}

@@ -15,6 +15,8 @@ public struct OperationError: Error, Sendable, LocalizedError, CustomStringConve
             "The request is invalid. Check the operation, JSON object, and timeout settings."
         case "invalid_token":
             "The access token is invalid. Sign in again before calling this operation."
+        case "session_store_error":
+            "The session store could not complete the operation. Check your session storage before trying again."
         case "request_too_large":
             "The request exceeds 4 MiB. Reduce the input size before trying again."
         case "response_too_large":

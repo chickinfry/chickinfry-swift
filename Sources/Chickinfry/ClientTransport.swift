@@ -8,8 +8,9 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
     public let origin: String
     private let timeout: TimeInterval
     private let bearer: String?
+    private let store: (any SessionStore)?
 
-    // Limit reflection output because private properties are included by default.
+    // Default reflection includes private credentials, so expose no stored properties.
     public var description: String { "ClientTransport" }
     public var debugDescription: String { description }
     public var customMirror: Mirror {
@@ -24,27 +25,41 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         }
         self.timeout = timeout
         self.bearer = nil
+        self.store = nil
     }
 
-    private init(origin: String, timeout: TimeInterval, bearer: String) {
+    private init(origin: String, timeout: TimeInterval, bearer: String?, store: (any SessionStore)?) {
         self.origin = origin
         self.timeout = timeout
         self.bearer = bearer
+        self.store = store
     }
 
-    /// Returns an authenticated copy; the original transport remains unchanged.
+    /// Returns an explicit bearer copy, without session storage or automatic refresh.
     public func withBearer(_ token: String) throws -> Self {
+        try Self.validateToken(token)
+        return Self(origin: origin, timeout: timeout, bearer: token, store: nil)
+    }
+
+    /// Uses the store's shared refresh coordinator; the original transport is unchanged.
+    public func withSession(_ store: any SessionStore) throws -> Self {
+        guard store.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        return Self(origin: origin, timeout: timeout, bearer: nil, store: store)
+    }
+
+    static func validateToken(_ token: String) throws {
         guard token.utf8.count == 43,
               token.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
                   || (48...57).contains($0) || $0 == 45 || $0 == 95 }) else {
             throw OperationError(code: "invalid_token", status: nil)
         }
-        return Self(origin: origin, timeout: timeout, bearer: token)
     }
 
     public func invoke<Input: Encodable & Sendable, Output: Decodable & Sendable>(
         _ operation: String, input: Input, as outputType: Output.Type = Output.self
     ) async throws -> Output {
+        let deadline = CallDeadline(timeout: timeout)
+        _ = try deadline.remaining()
         guard operation.range(of: "\\A[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*\\z",
                               options: .regularExpression) != nil else {
             throw OperationError(code: "invalid_input", status: nil)
@@ -62,6 +77,41 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
               let url = URL(string: origin + "/" + operation) else {
             throw OperationError(code: "invalid_input", status: nil)
         }
+        let stored: SessionRecord?
+        if let store {
+            stored = try await deadline.wait { try await loadSession(store, origin: origin) }
+        } else { stored = nil }
+        do {
+            do {
+                return try await exchange(url: url, body: body, bearer: stored?.accessToken ?? bearer,
+                                          deadline: deadline, as: outputType)
+            } catch let rejection as ServerRejection where rejection.error.code == "invalid_token" && rejection.error.status == 401 {
+                let error = rejection.error
+                guard operation != "auth.refresh", let store, let stored else { throw error }
+                let refreshed = try await deadline.wait {
+                    try await store.coordinator.refresh(expected: stored, store: store) {
+                        let refreshDeadline = CallDeadline(timeout: timeout)
+                        let input = RefreshInput(refresh_token: stored.refreshToken)
+                        let bytes = try JSONEncoder().encode(input)
+                        let output: RefreshOutput = try await exchange(
+                            url: URL(string: origin + "/auth.refresh")!, body: bytes, bearer: nil,
+                            deadline: refreshDeadline, as: RefreshOutput.self)
+                        return try output.record(origin: origin)
+                    }
+                }
+                guard let refreshed else { throw error }
+                return try await exchange(url: url, body: body, bearer: refreshed.accessToken,
+                                          deadline: deadline, as: outputType)
+            }
+        } catch let rejection as ServerRejection {
+            throw rejection.error
+        }
+    }
+
+    private func exchange<Output: Decodable & Sendable>(
+        url: URL, body: Data, bearer: String?, deadline: CallDeadline, as outputType: Output.Type
+    ) async throws -> Output {
+        let remaining = try deadline.remaining()
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
@@ -70,8 +120,8 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
 
         let receiver = ResponseReceiver()
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = timeout
+        configuration.timeoutIntervalForRequest = remaining
+        configuration.timeoutIntervalForResource = remaining
         configuration.httpShouldSetCookies = false
         configuration.httpCookieStorage = nil
         configuration.urlCache = nil
@@ -79,9 +129,10 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         let session = URLSession(configuration: configuration, delegate: receiver, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         let task = session.dataTask(with: request)
+        let networkTimeout = try deadline.remaining()
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                receiver.start(task: task, timeout: timeout, continuation: continuation)
+                receiver.start(task: task, timeout: networkTimeout, continuation: continuation)
             }
         } onCancel: {
             receiver.fail(code: "cancelled")
@@ -89,7 +140,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         guard let status = response.status else {
             throw OperationError(code: "invalid_response", status: nil)
         }
-        // Reject other encodings containing NUL and validate raw UTF-8 without Foundation's recovery behavior.
+        // Validate the original UTF-8 without Foundation encoding recovery.
         guard !response.body.contains(0),
               (response.body + Data([0])).withUnsafeBytes({
                   String(validatingCString: $0.bindMemory(to: CChar.self).baseAddress!) != nil
@@ -100,19 +151,24 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
             let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: response.body)
             let code = envelope?.error
             let valid = code?.range(of: "\\A[a-z_]+\\z", options: .regularExpression) != nil
-            throw OperationError(code: valid ? code! : "invalid_response", status: status)
+            guard valid else { throw OperationError(code: "invalid_response", status: status) }
+            throw ServerRejection(error: OperationError(code: code!, status: status))
         }
+        let output: Output
         do {
             guard (try JSONSerialization.jsonObject(with: response.body)) is [String: Any] else {
                 throw OperationError(code: "invalid_response", status: status)
             }
-            return try JSONDecoder().decode(outputType, from: response.body)
+            output = try JSONDecoder().decode(outputType, from: response.body)
         } catch {
             throw OperationError(code: "invalid_response", status: status)
         }
+        do { _ = try deadline.remaining() }
+        catch let error as OperationError { throw OperationError(code: error.code, status: status) }
+        return output
     }
 
-    private static func validateOrigin(_ raw: String) throws -> String {
+    static func validateOrigin(_ raw: String) throws -> String {
         let failure = OperationError(code: "invalid_origin", status: nil)
         // Inspect the raw authority before Foundation can normalize numeric hosts or escapes.
         guard !raw.contains("?"), !raw.contains("#"), !raw.contains("@"),
@@ -163,6 +219,44 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         return scheme + "://" + authority
     }
 }
+
+private struct RefreshInput: Encodable { let refresh_token: String }
+private struct RefreshOutput: Decodable, Sendable {
+    let access_token: String
+    let refresh_token: String
+    let expires_at: String
+    let refresh_expires_at: String
+    let user_id: String
+    let session_id: String
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        access_token = try values.decode(String.self, forKey: .access_token)
+        refresh_token = try values.decode(String.self, forKey: .refresh_token)
+        expires_at = try values.decode(String.self, forKey: .expires_at)
+        refresh_expires_at = try values.decode(String.self, forKey: .refresh_expires_at)
+        user_id = try values.decode(String.self, forKey: .user_id)
+        session_id = try values.decode(String.self, forKey: .session_id)
+        try ClientTransport.validateToken(access_token)
+        try ClientTransport.validateToken(refresh_token)
+        guard !expires_at.isEmpty, !refresh_expires_at.isEmpty, !user_id.isEmpty, !session_id.isEmpty else {
+            throw OperationError(code: "invalid_response", status: nil)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case access_token, refresh_token, expires_at, refresh_expires_at, user_id, session_id
+    }
+
+    func record(origin: String) throws -> SessionRecord {
+        try SessionRecord(origin: origin, accessToken: access_token, refreshToken: refresh_token,
+                          expiresAt: expires_at, refreshExpiresAt: refresh_expires_at,
+                          userID: user_id, sessionID: session_id)
+    }
+}
+
+// Only a fully received and decoded server error envelope carries this provenance.
+struct ServerRejection: Error { let error: OperationError }
 
 private struct ErrorEnvelope: Decodable { let error: String }
 private struct ReceivedResponse: Sendable { let body: Data; let status: Int? }

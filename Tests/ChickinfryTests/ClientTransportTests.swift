@@ -2,11 +2,11 @@ import Foundation
 import Testing
 @testable import Chickinfry
 
-private struct Payload: Codable, Sendable { let value: String }
-private struct Empty: Codable, Sendable {}
-private let validBody = Data("{\"value\":\"ok\"}".utf8)
+struct Payload: Codable, Sendable { let value: String }
+struct Empty: Codable, Sendable {}
+let validBody = Data("{\"value\":\"ok\"}".utf8)
 
-private func withPeer(_ responses: [PeerResponse] = [],
+func withPeer(_ responses: [PeerResponse] = [],
                       body: @Sendable (LoopbackServer) async throws -> Void) async throws {
     let server = try LoopbackServer(responses)
     do {
@@ -19,7 +19,7 @@ private func withPeer(_ responses: [PeerResponse] = [],
 }
 
 @discardableResult
-private func expectFailure(_ code: String, status: Int?,
+func expectFailure(_ code: String, status: Int?,
                            body: @Sendable () async throws -> Void) async -> OperationError? {
     do {
         try await body()
