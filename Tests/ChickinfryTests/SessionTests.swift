@@ -1,6 +1,10 @@
 import Foundation
 import Testing
+#if CHICKINFRY_CONFORMANCE
+@_spi(Conformance) @testable import Chickinfry
+#else
 @testable import Chickinfry
+#endif
 
 private func randomToken() -> String {
     String((UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "").prefix(43))
@@ -39,7 +43,7 @@ private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server
     return false
 }
 
-@Test func testStoredSessionRefreshesOnce() async throws {
+@Test func testSharedStoreAcrossClients() async throws {
     let gate = PeerGate()
     let oldAccess = randomToken()
     let newAccess = randomToken()
@@ -60,7 +64,8 @@ private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server
     try await store.save(old)
     let transport = try ClientTransport(origin: server.origin).withSession(store)
     let first = Task { try await transport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
-    let second = Task { try await transport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
+    let otherTransport = try ClientTransport(origin: server.origin).withSession(store)
+    let second = Task { try await otherTransport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
     let joined = await waitForFlight(store.coordinator, count: 2, server: server)
     await gate.open()
     let outputs = try await [first.value, second.value]
@@ -80,6 +85,149 @@ private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server
     #expect(saved.expiresAt == "2026-10-15T01:02:03.123456789Z")
     await server.stop()
 }
+
+#if CHICKINFRY_CONFORMANCE
+private final class RefreshHooks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+    private var completed = 0
+    private var sent = false
+    func enter(leader: Bool, transmitted: Bool) {
+        lock.withLock {
+            pending += 1
+            if leader { sent = transmitted }
+        }
+    }
+    func leave() { lock.withLock { pending -= 1 } }
+    func complete() { lock.withLock { completed += 1 } }
+    var state: (pending: Int, completed: Int, sent: Bool) { lock.withLock { (pending, completed, sent) } }
+}
+
+@Test func testRefreshParticipationWaitsForTransmissionAndRelease() async throws {
+    for action in ["release-leader", "release-follower", "release-late-follower", "failure", "cancel", "shutdown"] {
+        let lateFollower = action == "release-late-follower"
+        let reply = PeerGate()
+        let old = try record("http://127.0.0.1")
+        let renewed = try wire(record("http://127.0.0.1"))
+        let server = try LoopbackServer(responder: { request in
+            if request.path == "/auth.refresh" { return .gatedReply(200, renewed, reply) }
+            return request.headers["authorization"] == "Bearer " + old.accessToken
+                ? .reply(401, unauthorized) : .reply(200, validBody)
+        })
+        let store = try MemorySessionStore(origin: server.origin)
+        try await store.save(SessionRecord(origin: server.origin, accessToken: old.accessToken,
+                                          refreshToken: old.refreshToken, expiresAt: old.expiresAt,
+                                          refreshExpiresAt: old.refreshExpiresAt,
+                                          userID: old.userID, sessionID: old.sessionID))
+        let firstTransport = try ClientTransport(origin: server.origin).withSession(store)
+        let secondTransport = try ClientTransport(origin: server.origin).withSession(store)
+        let hooks = RefreshHooks()
+        let leaderEntered = PeerGate()
+        let followerEntered = PeerGate()
+        let followerRejected = PeerGate()
+        let followerMayJoin = PeerGate()
+        let leaderRelease = Conformance.Transmission()
+        let followerRelease = Conformance.Transmission()
+        let leaderExited = Conformance.Transmission()
+        func context(leader: Bool) -> Conformance.Call {
+            Conformance.Call(event: { event in
+                if event.phase == "completed" { hooks.complete() }
+            }, barrier: { point, _ in
+                if lateFollower && !leader && point == "both-originals-rejected" {
+                    await followerRejected.open()
+                    await followerMayJoin.wait()
+                }
+                guard point == "refresh-joined" else { return }
+                hooks.enter(leader: leader, transmitted: Conformance.call?.outcomeUnknown == true)
+                defer {
+                    hooks.leave()
+                    if leader { leaderExited.finish(true) }
+                }
+                await (leader ? leaderEntered : followerEntered).open()
+                let released = await (leader ? leaderRelease : followerRelease).wait()
+                try Task.checkCancellation()
+                guard released else { throw OperationError(code: "hook_failed", status: nil) }
+            }, clear: { _, _ in })
+        }
+        let leaderContext = context(leader: true)
+        let followerContext = context(leader: false)
+        let first = Task {
+            try await Conformance.$call.withValue(leaderContext) {
+                try await firstTransport.invoke("probe.echo", input: Empty(), as: Payload.self)
+            }
+        }
+        await leaderEntered.wait()
+        let second = Task {
+            try await Conformance.$call.withValue(followerContext) {
+                try await secondTransport.invoke("probe.echo", input: Empty(), as: Payload.self)
+            }
+        }
+        await (lateFollower ? followerRejected : followerEntered).wait()
+        await reply.open()
+        let end = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+        while await store.coordinator.conformanceCompletingCount == 0 && hooks.state.completed == 0
+                && DispatchTime.now().uptimeNanoseconds < end { await Task.yield() }
+        #expect(await store.coordinator.conformanceCompletingCount == 1)
+        if lateFollower {
+            // The sole original waiter is still held when the released follower joins the completed flight.
+            await followerMayJoin.open()
+            await followerEntered.wait()
+        }
+        #expect(hooks.state.sent)
+        #expect(hooks.state.completed == 0)
+        #expect(hooks.state.pending == 2)
+        switch action {
+        case "shutdown":
+            await store.coordinator.conformanceShutdown()
+            #expect(hooks.state.pending == 0)
+            #expect(await store.coordinator.conformanceTaskCount == 0)
+            leaderRelease.finish(true)
+            followerRelease.finish(true)
+            if case .success = await first.result { Issue.record("Shutdown completed a held call successfully") }
+            if case .success = await second.result { Issue.record("Shutdown completed a held call successfully") }
+        case "cancel":
+            first.cancel()
+            await expectFailure("cancelled", status: nil) { _ = try await first.value }
+            // Cancellation can finish the call before its barrier hook unwinds.
+            #expect(await leaderExited.wait())
+            #expect(hooks.state.pending == 1)
+            leaderRelease.finish(true)
+            followerRelease.finish(true)
+            #expect(try await second.value.value == "ok")
+        case "failure":
+            leaderRelease.finish(false)
+            followerRelease.finish(true)
+            await expectFailure("hook_failed", status: nil) { _ = try await first.value }
+            #expect(try await second.value.value == "ok")
+        default:
+            let releaseLeader = action == "release-leader"
+            (releaseLeader ? leaderRelease : followerRelease).finish(true)
+            let completionEnd = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+            while hooks.state.completed == 0 && DispatchTime.now().uptimeNanoseconds < completionEnd {
+                await Task.yield()
+            }
+            let releasedCompletedIndependently = hooks.state.completed == 1
+            #expect(releasedCompletedIndependently)
+            #expect(hooks.state.pending == 1)
+            if releasedCompletedIndependently {
+                #expect(try await (releaseLeader ? first : second).value.value == "ok")
+            }
+            (releaseLeader ? followerRelease : leaderRelease).finish(true)
+            #expect(try await first.value.value == "ok")
+            #expect(try await second.value.value == "ok")
+        }
+        #expect(hooks.state.pending == 0)
+        leaderRelease.finish(true)
+        followerRelease.finish(true)
+        while hooks.state.pending > 0 { await Task.yield() }
+        let requests = await server.log.requests
+        #expect(requests.filter { $0.path == "/auth.refresh" }.count == 1)
+        #expect(requests.filter { $0.path == "/probe.echo" }.count == (action.hasPrefix("release-") ? 4 : action == "shutdown" ? 2 : 3))
+        await store.coordinator.conformanceShutdown()
+        await server.stop()
+    }
+}
+#endif
 
 @Test func testRetried401DoesNotRefreshAgain() async throws {
     let refreshed = try record("https://example.com")
@@ -220,6 +368,30 @@ private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server
     }
 }
 
+@Test func testRejectedRefreshPreservesNewLogin() async throws {
+    let gate = PeerGate()
+    try await withPeer([.reply(401, unauthorized), .gatedReply(401, unauthorized, gate)]) { server in
+        let store = try MemorySessionStore(origin: server.origin)
+        try await store.save(record(server.origin))
+        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
+        await server.log.waitForRequests(2)
+        let newLogin = try record(server.origin)
+        try await store.save(newLogin)
+        let installed = try await store.load()
+        let newLoginInstalled = installed?.credential == newLogin.credential
+        await gate.open()
+        #expect(newLoginInstalled)
+        await expectFailure("invalid_token", status: 401) { _ = try await call.value }
+        let saved = try #require(await store.load())
+        let newLoginPreserved = sameRecord(saved, newLogin)
+        #expect(newLoginPreserved)
+        let requests = await server.log.requests
+        #expect(requests.map(\.path) == ["/notes.write", "/auth.refresh"])
+
+    }
+}
+
 @Test func testUncertainRefreshKeepsStoredCredential() async throws {
     try await withPeer([.reply(401, unauthorized), .disconnect]) { server in
         let store = try MemorySessionStore(origin: server.origin)
@@ -346,7 +518,7 @@ private actor FailingStore: SessionStore {
     }
 }
 
-@Test func cancelledRefreshWaiterLeavesOtherWaitersRunning() async throws {
+@Test func testCancelledWaiterDoesNotCancelOtherWaiters() async throws {
     let gate = PeerGate()
     let refreshed = try wire(record("https://example.com"))
     let server = try LoopbackServer(responder: { request in
@@ -409,6 +581,10 @@ private actor WaitingStore: SessionStore {
         await server.log.waitForRequests(2)
         call.cancel()
         await expectFailure("cancelled", status: nil) { _ = try await call.value }
+        #if CHICKINFRY_CONFORMANCE
+        await store.coordinator.conformanceShutdown()
+        #expect(await store.coordinator.conformanceTaskCount == 0)
+        #endif
         await expectFailure("invalid_token", status: 401) {
             let _: Payload = try await transport.invoke("notes.write", input: Empty())
         }

@@ -7,6 +7,13 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
     /// The single coordinator shared by every access to this store.
     public nonisolated let coordinator = SessionCoordinator()
     private var session: SessionRecord?
+    #if CHICKINFRY_CONFORMANCE
+    private var conformanceRevision = 0
+
+    @_spi(Conformance) public func conformanceSnapshot() -> (record: SessionRecord?, revision: Int) {
+        (session, conformanceRevision)
+    }
+    #endif
 
     /// Creates empty in-process storage, or throws if the origin is invalid.
     public init(origin: String) throws {
@@ -20,6 +27,9 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
     public func save(_ session: SessionRecord) async throws {
         guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
         self.session = session
+        #if CHICKINFRY_CONFORMANCE
+        conformanceRevision += 1
+        #endif
     }
 
     /// Returns true after replacement or false on a credential mismatch or absence; an origin mismatch throws.
@@ -27,6 +37,9 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
         guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
         guard self.session?.credential == expected.credential else { return false }
         self.session = session
+        #if CHICKINFRY_CONFORMANCE
+        conformanceRevision += 1
+        #endif
         return true
     }
 
@@ -34,6 +47,9 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
     public func clear(ifMatching expected: SessionRecord) async throws -> Bool {
         guard session?.credential == expected.credential else { return false }
         session = nil
+        #if CHICKINFRY_CONFORMANCE
+        conformanceRevision += 1
+        #endif
         return true
     }
 

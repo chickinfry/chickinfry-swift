@@ -186,18 +186,25 @@ func expectFailure(_ code: String, status: Int?,
 }
 
 @Test(arguments: [false, true]) func deadlineCancelsSilentAndTricklingPeers(headers: Bool) async throws {
-    try await withPeer([.stall(headers), .reply(200, validBody)]) { server in
-        let transport = try ClientTransport(origin: server.origin, timeout: 0.2)
+    let reply = PeerGate()
+    try await withPeer([.stall(headers), .gatedReply(200, validBody, reply)]) { server in
+        let transport = try ClientTransport(origin: server.origin, timeout: 1)
         let start = ContinuousClock.now
-        await expectFailure("timeout", status: headers ? 200 : nil) {
-            let _: Payload = try await transport.invoke("notes.read", input: Empty())
+        let stalled = Task {
+            try await transport.invoke("notes.read", input: Empty(), as: Payload.self)
         }
-        #expect(start.duration(to: .now) < .seconds(2))
+        await server.log.waitForRequests(1)
+        await expectFailure("timeout", status: headers ? 200 : nil) { _ = try await stalled.value }
+        #expect(start.duration(to: .now) < .seconds(5))
         await server.log.waitForCompletions(1)
         #expect(await server.log.completions.first?.disconnected == true)
         #expect(await server.log.requests.count == 1)
-        let output: Payload = try await transport.invoke("notes.read", input: Empty())
-        #expect(output.value == "ok")
+        // The recovery request must not inherit the deliberately short timeout of the stalled request.
+        let recovery = try ClientTransport(origin: server.origin)
+        let next = Task { try await recovery.invoke("notes.read", input: Empty(), as: Payload.self) }
+        await server.log.waitForRequests(2)
+        await reply.open()
+        #expect(try await next.value.value == "ok")
     }
 }
 

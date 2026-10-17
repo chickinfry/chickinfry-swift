@@ -40,9 +40,19 @@ private final class DeadlineWait<Value: Sendable>: @unchecked Sendable {
         let cancelled = lock.withLock {
             guard !finished else { return true }
             self.continuation = continuation
+            #if CHICKINFRY_CONFORMANCE
+            let observation = Conformance.call
+            #endif
             work = Task.detached {
+                #if CHICKINFRY_CONFORMANCE
+                await Conformance.$call.withValue(observation) {
+                    do { self.finish(.success(try await operation())) }
+                    catch { self.finish(.failure(error)) }
+                }
+                #else
                 do { self.finish(.success(try await operation())) }
                 catch { self.finish(.failure(error)) }
+                #endif
             }
             timer = Task.detached {
                 do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }

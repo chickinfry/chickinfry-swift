@@ -237,7 +237,7 @@ final class LoopbackServer: Sendable {
         case let .stall(headers):
             if headers {
                 _ = write(Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n".utf8), to: client)
-                let byte = Data(repeating: 32, count: 16 * 1024)
+                let byte = Data(repeating: 32, count: 1024)
                 while write(byte, to: client) {
                     sent += byte.count
                     try? await Task.sleep(nanoseconds: 20_000_000)

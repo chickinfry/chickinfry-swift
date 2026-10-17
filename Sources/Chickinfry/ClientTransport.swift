@@ -59,6 +59,14 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         _ operation: String, input: Input, as outputType: Output.Type = Output.self
     ) async throws -> Output {
         let deadline = CallDeadline(timeout: timeout)
+        #if CHICKINFRY_CONFORMANCE
+        let observation = Conformance.call
+        defer {
+            observation?.select()
+            observation?.observe("completed", immediate: true)
+        }
+        try await observation?.barrier("sdk-entered", nil)
+        #endif
         _ = try deadline.remaining()
         guard operation.range(of: "\\A[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*\\z",
                               options: .regularExpression) != nil else {
@@ -86,6 +94,9 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
                 return try await exchange(url: url, body: body, bearer: stored?.accessToken ?? bearer,
                                           deadline: deadline, as: outputType)
             } catch let rejection as ServerRejection where rejection.error.code == "invalid_token" && rejection.error.status == 401 {
+                #if CHICKINFRY_CONFORMANCE
+                try await observation?.barrier("both-originals-rejected", nil)
+                #endif
                 let error = rejection.error
                 guard operation != "auth.refresh", let store, let stored else { throw error }
                 let refreshed = try await deadline.wait {
@@ -96,7 +107,11 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
                         let output: RefreshOutput = try await exchange(
                             url: URL(string: origin + "/auth.refresh")!, body: bytes, bearer: nil,
                             deadline: refreshDeadline, as: RefreshOutput.self)
-                        return try output.record(origin: origin)
+                        let refreshed = try output.record(origin: origin)
+                        #if CHICKINFRY_CONFORMANCE
+                        observation?.credentials(refreshed)
+                        #endif
+                        return refreshed
                     }
                 }
                 guard let refreshed else { throw error }
@@ -111,6 +126,10 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
     private func exchange<Output: Decodable & Sendable>(
         url: URL, body: Data, bearer: String?, deadline: CallDeadline, as outputType: Output.Type
     ) async throws -> Output {
+        #if CHICKINFRY_CONFORMANCE
+        let observation = Conformance.call
+        observation?.exchange()
+        #endif
         let remaining = try deadline.remaining()
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -119,6 +138,9 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         if let bearer { request.setValue("Bearer " + bearer, forHTTPHeaderField: "Authorization") }
 
         let receiver = ResponseReceiver()
+        #if CHICKINFRY_CONFORMANCE
+        receiver.observation = observation
+        #endif
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = remaining
         configuration.timeoutIntervalForResource = remaining
@@ -140,11 +162,15 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         guard let status = response.status else {
             throw OperationError(code: "invalid_response", status: nil)
         }
-        // Validate the original UTF-8 without Foundation encoding recovery.
-        guard !response.body.contains(0),
-              (response.body + Data([0])).withUnsafeBytes({
-                  String(validatingCString: $0.bindMemory(to: CChar.self).baseAddress!) != nil
-              }) else {
+        #if CHICKINFRY_CONFORMANCE
+        observation?.inspect(Conformance.Buffers(
+            exchange: response.observationID, response: { [weak response] in response?.body.count ?? 0 }, accumulated: { 0 },
+            holdOwner: { [weak response] in
+                guard let response else { return nil }
+                return { withExtendedLifetime(response) {} }
+            }))
+        #endif
+        guard Self.validUTF8(response.body) else {
             throw OperationError(code: "invalid_response", status: status)
         }
         if !(200..<300).contains(status) {
@@ -152,6 +178,9 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
             let code = envelope?.error
             let valid = code?.range(of: "\\A[a-z_]+\\z", options: .regularExpression) != nil
             guard valid else { throw OperationError(code: "invalid_response", status: status) }
+            #if CHICKINFRY_CONFORMANCE
+            observation?.confirmedOutcome()
+            #endif
             throw ServerRejection(error: OperationError(code: code!, status: status))
         }
         let output: Output
@@ -165,7 +194,22 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         }
         do { _ = try deadline.remaining() }
         catch let error as OperationError { throw OperationError(code: error.code, status: status) }
+        #if CHICKINFRY_CONFORMANCE
+        observation?.confirmedOutcome()
+        #endif
         return output
+    }
+
+    private static func validUTF8(_ body: Data) -> Bool {
+        var decoder = UTF8()
+        var iterator = body.makeIterator()
+        while true {
+            switch decoder.decode(&iterator) {
+            case .scalarValue(let value): if value.value == 0 { return false }
+            case .emptyInput: return true
+            case .error: return false
+            }
+        }
     }
 
     static func validateOrigin(_ raw: String) throws -> String {
@@ -259,7 +303,20 @@ private struct RefreshOutput: Decodable, Sendable {
 struct ServerRejection: Error { let error: OperationError }
 
 private struct ErrorEnvelope: Decodable { let error: String }
-private struct ReceivedResponse: Sendable { let body: Data; let status: Int? }
+private final class ReceivedResponse: @unchecked Sendable {
+    let body: Data
+    let status: Int?
+    #if CHICKINFRY_CONFORMANCE
+    var observation: Conformance.Call?
+    var observationID = UUID()
+    deinit { observation?.account(-body.count) }
+    #endif
+
+    init(body: Data, status: Int?) {
+        self.body = body
+        self.status = status
+    }
+}
 
 // All delegate, cancellation, and deadline state is protected by the same lock.
 private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @unchecked Sendable {
@@ -270,6 +327,14 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
     private var deadline: Task<Void, Never>?
     private var continuation: CheckedContinuation<ReceivedResponse, any Error>?
     private var finished = false
+    #if CHICKINFRY_CONFORMANCE
+    var observation: Conformance.Call?
+    private let construction = Conformance.construction
+    private let refreshTransmission = Conformance.refreshTransmission
+    private let observationID = UUID()
+    private var immediate = false
+    private var observationIsImmediate: Bool { lock.withLock { immediate } }
+    #endif
 
     func start(task: URLSessionDataTask, timeout: TimeInterval,
                continuation: CheckedContinuation<ReceivedResponse, any Error>) {
@@ -284,6 +349,9 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
                 catch { return }
                 self.fail(code: "timeout")
             }
+            #if CHICKINFRY_CONFORMANCE
+            construction?.networkEntry()
+            #endif
             task.resume()
             return false
         }
@@ -303,7 +371,12 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
             guard !finished else { return nil }
             finished = true
             if status == nil { status = (task?.response as? HTTPURLResponse)?.statusCode }
-            let result = (continuation, task, deadline, ReceivedResponse(body: body, status: status))
+            let response = ReceivedResponse(body: body, status: status)
+            #if CHICKINFRY_CONFORMANCE
+            response.observation = observation
+            response.observationID = observationID
+            #endif
+            let result = (continuation, task, deadline, response)
             continuation = nil
             task = nil
             deadline = nil
@@ -313,6 +386,9 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
         guard let (continuation, task, deadline, response) = completion else { return }
         deadline?.cancel()
         if let code {
+            #if CHICKINFRY_CONFORMANCE
+            observation?.observe("cancel-requested", immediate: observationIsImmediate)
+            #endif
             task?.cancel()
             continuation?.resume(throwing: OperationError(code: code, status: response.status))
         } else {
@@ -326,30 +402,71 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
         let active = lock.withLock {
             guard !finished else { return false }
             status = (response as? HTTPURLResponse)?.statusCode
+            #if CHICKINFRY_CONFORMANCE
+            immediate = status.map { (300..<400).contains($0) } ?? false
+            #endif
             return true
         }
+        #if CHICKINFRY_CONFORMANCE
+        if active {
+            observation?.observe("headers", status: (response as? HTTPURLResponse)?.statusCode,
+                                 immediate: observationIsImmediate)
+        }
+        #endif
         completionHandler(active ? .allow : .cancel)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        let overflow = lock.withLock {
-            guard !finished else { return false }
+        let reception = lock.withLock { () -> Bool? in
+            guard !finished else { return nil }
             guard data.count <= 1024 * 1024 - body.count else { return true }
             body.append(data)
+            #if CHICKINFRY_CONFORMANCE
+            observation?.account(data.count)
+            #endif
             return false
         }
+        guard let overflow = reception else { return }
+        #if CHICKINFRY_CONFORMANCE
+        observation?.inspect(Conformance.Buffers(
+            exchange: observationID, response: { 0 }, accumulated: { [weak self] in
+                guard let self else { return 0 }
+                return self.lock.withLock { self.body.count }
+            }, holdOwner: { [weak self] in
+                guard let self else { return nil }
+                return { withExtendedLifetime(self) {} }
+            }))
+        observation?.observe("read", bytes: data.count)
+        if overflow { observation?.observe("limit", immediate: true) }
+        #endif
         if overflow { fail(code: "response_too_large") }
     }
+
+    #if CHICKINFRY_CONFORMANCE
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        if bytesSent > 0 {
+            observation?.transmitted()
+            refreshTransmission?.finish(true)
+        }
+    }
+    #endif
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
-        // FoundationNetworking buffers 301...308 bodies before this callback, bypassing the data limit.
+        // Declining redirection does not guarantee streamed delivery of the original body.
         lock.withLock { if !finished { status = response.statusCode } }
         completionHandler(nil)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        #if CHICKINFRY_CONFORMANCE
+        if (error as? URLError)?.code == .cancelled {
+            observation?.observe("cancel-observed", immediate: observationIsImmediate)
+        }
+        observation?.observe("reader-closed", immediate: observationIsImmediate)
+        #endif
         if let error {
             let urlError = error as? URLError
             let code = urlError?.code == .timedOut ? "timeout"
