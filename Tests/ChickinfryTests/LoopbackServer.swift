@@ -9,6 +9,7 @@ enum PeerResponse: Sendable {
     case reply(Int, Data, [String: String] = [:])
     case gatedReply(Int, Data, PeerGate)
     case stream(Int)
+    case redirectStream(Int, Bool, Int)
     case stall(Bool)
     case disconnect
     case truncated
@@ -233,6 +234,36 @@ final class LoopbackServer: Sendable {
                 if write(Data(chunk.prefix(next)), to: client) { sent += next }
                 else { disconnected = true }
                 try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        case let .redirectStream(status, chunked, total):
+            let framing = chunked ? "Transfer-Encoding: chunked" : "Content-Length: \(total)"
+            let header = "HTTP/1.1 \(status) Test\r\nLocation: /sink\r\n\(framing)\r\nConnection: close\r\n\r\n"
+            disconnected = !write(Data(header.utf8), to: client)
+            let chunk = Data(repeating: 32, count: 16 * 1024)
+            while sent < 1024 * 1024 + 1, !disconnected {
+                let count = min(chunk.count, 1024 * 1024 + 1 - sent)
+                if chunked { disconnected = !write(Data("\(String(count, radix: 16))\r\n".utf8), to: client) }
+                if disconnected { break }
+                chunk.withUnsafeBytes { bytes in
+                    var offset = 0
+                    while offset < count {
+                        #if canImport(Darwin)
+                        let written = send(client, bytes.baseAddress!.advanced(by: offset), count - offset, 0)
+                        #else
+                        let written = send(client, bytes.baseAddress!.advanced(by: offset), count - offset, Int32(MSG_NOSIGNAL))
+                        #endif
+                        guard written > 0 else { disconnected = true; break }
+                        offset += written
+                        sent += written
+                    }
+                }
+                if chunked, !disconnected { disconnected = !write(Data("\r\n".utf8), to: client) }
+                // Give URLSession a scheduling turn while the response tail stays unsent.
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            if !disconnected {
+                var byte: UInt8 = 0
+                disconnected = recv(client, &byte, 1, 0) <= 0
             }
         case let .stall(headers):
             if headers {

@@ -7,6 +7,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         let task: Task<Void, Never>
         var waiters: [UUID: CheckedContinuation<SessionRecord?, any Error>]
         #if CHICKINFRY_CONFORMANCE
+        var transportObservation: Conformance.Call?
         var observations: [UUID: Conformance.Call] = [:]
         var result: Result<SessionRecord?, any Error>?
         #endif
@@ -118,6 +119,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                 #if CHICKINFRY_CONFORMANCE
                 conformanceWork[id] = task
                 let observation = Conformance.call
+                flights[key]!.transportObservation = observation
                 flights[key]!.observations[waiter] = observation
                 conformanceJoin(waiter: waiter, id: id, observation: observation, transmission: transmission)
                 #endif
@@ -149,10 +151,14 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
             conformanceHooks[waiter] = nil
             guard flights[key]?.id == id,
                   let continuation = flights[key]?.waiters.removeValue(forKey: waiter) else { return }
-            flights[key]?.observations[waiter] = nil
+            let observation = flights[key]?.observations.removeValue(forKey: waiter)
+            let transportObservation = flights[key]?.transportObservation
             if flights[key]?.waiters.isEmpty == true { flights[key] = nil }
             if case .failure(let error)? = hookResult { continuation.resume(throwing: error) }
-            else { continuation.resume(with: result) }
+            else {
+                if case .failure = result, let observation { transportObservation?.project(to: observation) }
+                continuation.resume(with: result)
+            }
         }
     }
     #endif

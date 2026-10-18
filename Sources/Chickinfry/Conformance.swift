@@ -75,6 +75,11 @@ import Foundation
         private var peak = 0
         private var status: Int?
         private var pending: [(String, Int?)] = []
+        private var lifecycle: [(String, Int?)] = []
+        private var followers: [Call] = []
+        private var publications: [(value: Event, emit: Bool, followers: [Call])] = []
+        private var publishing = false
+        private var selected = false
         private var sent = false
         private var confirmed = false
         private var uncertainRefresh = false
@@ -102,8 +107,11 @@ import Foundation
             lock.withLock { uncertainRefresh || (sent && !confirmed) }
         }
 
-        func exchange() {
-            lock.withLock { pending = []; status = nil; sent = false; confirmed = false }
+        func exchange(immediate: Bool) {
+            lock.withLock {
+                pending = []; lifecycle = []; followers = []
+                selected = immediate; status = nil; sent = false; confirmed = false
+            }
         }
 
         func transmitted() { lock.withLock { sent = true } }
@@ -118,25 +126,61 @@ import Foundation
         }
 
         func observe(_ phase: String, status: Int? = nil, bytes: Int = 0, immediate: Bool = false) {
-            let value: Event? = lock.withLock {
+            lock.withLock {
                 if let status { self.status = status }
                 read += bytes
-                if phase == "read" || phase == "limit" || immediate {
-                    return snapshot(phase, status: self.status)
-                }
-                pending.append((phase, self.status))
-                return nil
+                let shared = phase == "headers" || phase == "cancel-requested"
+                    || phase == "cancel-observed" || phase == "reader-closed"
+                if shared { lifecycle.append((phase, self.status)) }
+                let emit = phase == "read" || phase == "limit" || immediate || selected
+                if !emit { pending.append((phase, self.status)) }
+                publications.append((snapshot(phase, status: self.status), emit, shared ? followers : []))
             }
-            if let value { event(value) }
+            publish()
+        }
+
+        func project(to follower: Call) {
+            guard self !== follower else { return }
+            lock.withLock {
+                // Keep each waiter's own byte history and receive late reader termination.
+                follower.lock.withLock {
+                    follower.pending = lifecycle
+                    follower.status = status
+                }
+                followers.append(follower)
+            }
         }
 
         func select() {
-            let values = lock.withLock {
-                let values = pending.map { snapshot($0.0, status: $0.1) }
+            lock.withLock {
+                selected = true
+                publications += pending.map { (snapshot($0.0, status: $0.1), true, []) }
                 pending = []
-                return values
             }
-            for value in values { event(value) }
+            publish()
+        }
+
+        private func publish() {
+            let started = lock.withLock {
+                guard !publishing else { return false }
+                publishing = true
+                return true
+            }
+            guard started else { return }
+            while true {
+                let values = lock.withLock {
+                    let values = publications
+                    publications = []
+                    if values.isEmpty { publishing = false }
+                    return values
+                }
+                guard !values.isEmpty else { return }
+                // One drainer preserves replay and follower order without calling out under the lock.
+                for (value, emit, recipients) in values {
+                    if emit { event(value) }
+                    for follower in recipients { follower.observe(value.phase, status: value.httpStatus) }
+                }
+            }
         }
 
         func inspect(_ buffers: Buffers) {

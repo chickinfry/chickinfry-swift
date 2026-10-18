@@ -92,7 +92,8 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         do {
             do {
                 return try await exchange(url: url, body: body, bearer: stored?.accessToken ?? bearer,
-                                          deadline: deadline, as: outputType)
+                                          deadline: deadline, as: outputType,
+                                          finalExchange: stored == nil || operation == "auth.refresh")
             } catch let rejection as ServerRejection where rejection.error.code == "invalid_token" && rejection.error.status == 401 {
                 #if CHICKINFRY_CONFORMANCE
                 try await observation?.barrier("both-originals-rejected", nil)
@@ -116,7 +117,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
                 }
                 guard let refreshed else { throw error }
                 return try await exchange(url: url, body: body, bearer: refreshed.accessToken,
-                                          deadline: deadline, as: outputType)
+                                          deadline: deadline, as: outputType, finalExchange: true)
             }
         } catch let rejection as ServerRejection {
             throw rejection.error
@@ -124,11 +125,12 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
     }
 
     private func exchange<Output: Decodable & Sendable>(
-        url: URL, body: Data, bearer: String?, deadline: CallDeadline, as outputType: Output.Type
+        url: URL, body: Data, bearer: String?, deadline: CallDeadline, as outputType: Output.Type,
+        finalExchange: Bool = false
     ) async throws -> Output {
         #if CHICKINFRY_CONFORMANCE
         let observation = Conformance.call
-        observation?.exchange()
+        observation?.exchange(immediate: finalExchange)
         #endif
         let remaining = try deadline.remaining()
         var request = URLRequest(url: url)
@@ -356,6 +358,9 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
             return false
         }
         if alreadyCancelled {
+            #if CHICKINFRY_CONFORMANCE
+            observation?.observe("cancel-requested", immediate: true)
+            #endif
             task.cancel()
             continuation.resume(throwing: OperationError(code: "cancelled", status: nil))
         }
@@ -363,7 +368,7 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
 
     func fail(code: String) { finish(code: code) }
 
-    private func finish(code: String?) {
+    private func finish(code: String?, cancelTask: Bool = true) {
         let completion = lock.withLock { () -> (
             CheckedContinuation<ReceivedResponse, any Error>?, URLSessionDataTask?, Task<Void, Never>?,
             ReceivedResponse
@@ -386,10 +391,12 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
         guard let (continuation, task, deadline, response) = completion else { return }
         deadline?.cancel()
         if let code {
-            #if CHICKINFRY_CONFORMANCE
-            observation?.observe("cancel-requested", immediate: observationIsImmediate)
-            #endif
-            task?.cancel()
+            if cancelTask, let task {
+                #if CHICKINFRY_CONFORMANCE
+                observation?.observe("cancel-requested", immediate: observationIsImmediate)
+                #endif
+                task.cancel()
+            }
             continuation?.resume(throwing: OperationError(code: code, status: response.status))
         } else {
             continuation?.resume(returning: response)
@@ -403,7 +410,9 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
             guard !finished else { return false }
             status = (response as? HTTPURLResponse)?.statusCode
             #if CHICKINFRY_CONFORMANCE
-            immediate = status.map { (300..<400).contains($0) } ?? false
+            immediate = status.map {
+                (300..<400).contains($0) || ($0 != 401 && refreshTransmission == nil)
+            } ?? false
             #endif
             return true
         }
@@ -413,10 +422,18 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
                                  immediate: observationIsImmediate)
         }
         #endif
-        completionHandler(active ? .allow : .cancel)
+        if active, let status = (response as? HTTPURLResponse)?.statusCode, (300..<400).contains(status) {
+            fail(code: "invalid_response")
+            completionHandler(.cancel)
+        } else {
+            completionHandler(active ? .allow : .cancel)
+        }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        #if CHICKINFRY_CONFORMANCE
+        observation?.observe("read", bytes: data.count)
+        #endif
         let reception = lock.withLock { () -> Bool? in
             guard !finished else { return nil }
             guard data.count <= 1024 * 1024 - body.count else { return true }
@@ -436,7 +453,6 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
                 guard let self else { return nil }
                 return { withExtendedLifetime(self) {} }
             }))
-        observation?.observe("read", bytes: data.count)
         if overflow { observation?.observe("limit", immediate: true) }
         #endif
         if overflow { fail(code: "response_too_large") }
@@ -455,8 +471,19 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
-        // Declining redirection does not guarantee streamed delivery of the original body.
-        lock.withLock { if !finished { status = response.statusCode } }
+        // URLSession can accumulate the declined body before delivering data callbacks.
+        lock.withLock {
+            if !finished {
+                status = response.statusCode
+                #if CHICKINFRY_CONFORMANCE
+                immediate = true
+                #endif
+            }
+        }
+        #if CHICKINFRY_CONFORMANCE
+        observation?.observe("headers", status: response.statusCode, immediate: true)
+        #endif
+        fail(code: "invalid_response")
         completionHandler(nil)
     }
 
@@ -471,7 +498,7 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
             let urlError = error as? URLError
             let code = urlError?.code == .timedOut ? "timeout"
                 : urlError?.code == .cancelled ? "cancelled" : "transport_error"
-            fail(code: code)
+            finish(code: code, cancelTask: false)
         } else {
             finish(code: nil)
         }

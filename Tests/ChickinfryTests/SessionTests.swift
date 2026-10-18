@@ -227,6 +227,143 @@ private final class RefreshHooks: @unchecked Sendable {
         await server.stop()
     }
 }
+private final class RefreshEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [Conformance.Event] = []
+    func record(_ event: Conformance.Event) { lock.withLock { events.append(event) } }
+    var snapshot: [Conformance.Event] { lock.withLock { events } }
+}
+
+@Test func sharedRefreshProjectionKeepsPublishedBytesAndLateTermination() {
+    let events = RefreshEvents()
+    let follower = Conformance.Call(event: { events.record($0) }, barrier: { _, _ in }, clear: { _, _ in })
+    let source = Conformance.Call(event: { _ in }, barrier: { _, _ in }, clear: { _, _ in })
+    follower.exchange(immediate: false)
+    follower.observe("headers", status: 401)
+    follower.account(1024 * 1024)
+    follower.observe("read", bytes: 1024 * 1024 + 1)
+    follower.observe("limit")
+    follower.account(-1024 * 1024)
+    source.exchange(immediate: false)
+    source.observe("cancel-requested")
+    source.select()
+    source.observe("completed", immediate: true)
+    source.project(to: follower)
+    follower.select()
+    follower.observe("completed", immediate: true)
+    source.observe("cancel-observed")
+    source.observe("reader-closed")
+    let values = events.snapshot
+    #expect(values.map(\.phase) == ["read", "limit", "cancel-requested", "completed", "cancel-observed", "reader-closed"])
+    #expect(values.allSatisfy { $0.readBytes == 1024 * 1024 + 1 && $0.peakRetainedBytes == 1024 * 1024 })
+    #expect(values.suffix(4).allSatisfy { $0.httpStatus == nil && $0.retainedBytes == 0 })
+}
+
+@Test func sharedRefreshProjectionSerializesLateTerminationDuringReplay() {
+    let events = RefreshEvents()
+    let firstPublished = DispatchSemaphore(value: 0)
+    let releaseReplay = DispatchSemaphore(value: 0)
+    let replayFinished = DispatchSemaphore(value: 0)
+    let follower = Conformance.Call(event: { event in
+        events.record(event)
+        if event.phase == "headers" {
+            firstPublished.signal()
+            #expect(releaseReplay.wait(timeout: .now() + 5) == .success)
+        }
+    }, barrier: { _, _ in }, clear: { _, _ in })
+    let source = Conformance.Call(event: { _ in }, barrier: { _, _ in }, clear: { _, _ in })
+    follower.exchange(immediate: false)
+    follower.observe("headers", status: 401)
+    source.exchange(immediate: false)
+    source.observe("headers", status: 307)
+    source.observe("cancel-requested")
+    source.select()
+    source.project(to: follower)
+    DispatchQueue.global().async {
+        follower.select()
+        replayFinished.signal()
+    }
+    defer { releaseReplay.signal() }
+    #expect(firstPublished.wait(timeout: .now() + 5) == .success)
+    source.observe("cancel-observed")
+    source.observe("reader-closed")
+    releaseReplay.signal()
+    #expect(replayFinished.wait(timeout: .now() + 5) == .success)
+    let values = events.snapshot
+    #expect(values.map(\.phase) == ["headers", "cancel-requested", "cancel-observed", "reader-closed"])
+    #expect(values.allSatisfy { $0.httpStatus == 307 && $0.readBytes == 0 })
+}
+
+@Test(arguments: [500, 200, 307])
+func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
+    let reply = PeerGate()
+    let leaderJoined = PeerGate()
+    let followerJoined = PeerGate()
+    let old = try record("http://127.0.0.1")
+    let refreshBody = refreshStatus == 200
+        ? try wire(record("http://127.0.0.1")) : Data("{\"error\":\"operation_failed\"}".utf8)
+    let server = try LoopbackServer(responder: { request in
+        if request.path == "/auth.refresh" { return .gatedReply(refreshStatus, refreshBody, reply) }
+        return request.headers["authorization"] == "Bearer " + old.accessToken
+            ? .reply(401, unauthorized) : .reply(201, validBody)
+    })
+    let store = try MemorySessionStore(origin: server.origin)
+    try await store.save(SessionRecord(origin: server.origin, accessToken: old.accessToken,
+                                      refreshToken: old.refreshToken, expiresAt: old.expiresAt,
+                                      refreshExpiresAt: old.refreshExpiresAt,
+                                      userID: old.userID, sessionID: old.sessionID))
+    let transport = try ClientTransport(origin: server.origin).withSession(store)
+    let leaderEvents = RefreshEvents()
+    let followerEvents = RefreshEvents()
+    func call(_ events: RefreshEvents, joined: PeerGate) async throws -> Payload {
+        let context = Conformance.Call(event: { events.record($0) }, barrier: { point, _ in
+            if point == "refresh-joined" { await joined.open() }
+        }, clear: { _, _ in })
+        return try await Conformance.$call.withValue(context) {
+            try await transport.invoke("probe.echo", input: Empty(), as: Payload.self)
+        }
+    }
+    let leader = Task { try await call(leaderEvents, joined: leaderJoined) }
+    await leaderJoined.wait()
+    let follower = Task { try await call(followerEvents, joined: followerJoined) }
+    await followerJoined.wait()
+    await reply.open()
+    for task in [leader, follower] {
+        if refreshStatus == 200 { #expect(try await task.value.value == "ok") }
+        else {
+            await expectFailure(refreshStatus == 500 ? "operation_failed" : "invalid_response", status: refreshStatus) {
+                _ = try await task.value
+            }
+        }
+    }
+    let end = ContinuousClock.now + .seconds(2)
+    while (!leaderEvents.snapshot.contains { $0.phase == "reader-closed" }
+           || !followerEvents.snapshot.contains { $0.phase == "reader-closed" }) && ContinuousClock.now < end {
+        await Task.yield()
+    }
+    let finalStatus = refreshStatus == 200 ? 201 : refreshStatus
+    for events in [leaderEvents.snapshot, followerEvents.snapshot] {
+        let projected = events.filter { $0.phase != "read" }
+        #expect(projected.allSatisfy { $0.httpStatus == finalStatus })
+        #expect(projected.filter { $0.phase == "headers" }.count == 1)
+        #expect(projected.filter { $0.phase == "reader-closed" }.count == 1)
+        #expect(projected.filter { $0.phase == "completed" }.count == 1)
+        if refreshStatus == 307 {
+            #expect(projected.filter { $0.phase == "cancel-requested" }.count == 1)
+            #expect(projected.filter { $0.phase == "cancel-observed" }.count == 1)
+        } else {
+            #expect(!projected.contains { $0.phase == "cancel-requested" || $0.phase == "cancel-observed" })
+        }
+    }
+    let followerReads = followerEvents.snapshot.filter { $0.phase == "read" }
+    #expect(followerReads.allSatisfy { $0.httpStatus == 401 || (refreshStatus == 200 && $0.httpStatus == 201) })
+    #expect(followerEvents.snapshot.last?.readBytes == unauthorized.count + (refreshStatus == 200 ? validBody.count : 0))
+    let requests = await server.log.requests
+    #expect(requests.filter { $0.path == "/auth.refresh" }.count == 1)
+    #expect(requests.filter { $0.path == "/probe.echo" }.count == (refreshStatus == 200 ? 4 : 2))
+    await store.coordinator.conformanceShutdown()
+    await server.stop()
+}
 #endif
 
 @Test func testRetried401DoesNotRefreshAgain() async throws {

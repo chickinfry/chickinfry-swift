@@ -7,7 +7,7 @@ import Darwin
 import Glibc
 #endif
 
-private final class Messages: @unchecked Sendable {
+final class Messages: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [JSON] = []
     func append(_ value: JSON) { lock.withLock { storage.append(value) } }
@@ -281,17 +281,15 @@ private func createInheritedStore(_ process: DriverProcess) throws -> JSON {
     }
 }
 
-@Test func incompleteTransportIsNotAdvertised() async throws {
+@Test func transportObservationRejectsUnknownCalls() async throws {
     let messages = Messages()
     let driver = Driver(credentials: [:], output: { messages.append($0) })
     try await handshake(driver)
-    let hello = try await messages.wait { $0["id"] == .string("c:hello") }
-    #expect(hello["result"]["capabilities"].array?.contains(.string("client.transport")) == false)
     try await driver.receive(request("c:observe", "client.observe", [
-        "caseId": .string("case"), "timeoutMs": .int(1000), "callId": .string("c:call"), "afterSequence": .int(0),
+        "caseId": .string("case"), "timeoutMs": .int(1000), "callId": .string("c:missing"), "afterSequence": .int(0),
     ]))
     let result = try await messages.wait { $0["id"] == .string("c:observe") }
-    #expect(result["error"]["code"] == .string("unimplemented"))
+    #expect(result["error"]["code"] == .string("invalid_reference"))
     await driver.shutdown()
 }
 

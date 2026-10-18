@@ -2,7 +2,7 @@ import Foundation
 @_spi(Conformance) import Chickinfry
 
 let driverVersion = "1.0.0"
-let capabilities = ["client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace"]
+let capabilities = ["client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace", "client.transport"]
 
 private struct ClientEntry: Sendable {
     let transport: ClientTransport
@@ -213,10 +213,10 @@ actor Driver {
             }
             let operation = try args.text("operation")
             let observation = self.observation
-            observation.start(id)
             let credentials = self.credentials
             let secretValues = self.secretValues
             let context = Conformance.Call(event: { observation.record(id, event: $0) }, barrier: { point, flight in
+                if point == "sdk-entered" { observation.start(id) }
                 try await self.arrive(id: id, point: point, flight: flight)
             }, clear: { expected, removed in
                 guard let store = client.store else { return }
@@ -253,7 +253,8 @@ actor Driver {
                             "httpStatus": .optional(observation.status(id))])
         case "client.observe":
             try fields(["callId", "afterSequence"])
-            throw ProtocolFailure.unimplemented
+            guard let after = args["afterSequence"].integer, after >= 0 else { throw ProtocolFailure.invalidArgs }
+            return try observation.snapshot(args.text("callId"), after: after)
         case "session.store.create":
             try fields(["storeRef", "origin"], optional: ["recordRef", "accessRef", "refreshRef"])
             let name = try ref("storeRef")

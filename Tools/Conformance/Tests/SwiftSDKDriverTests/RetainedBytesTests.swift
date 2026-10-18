@@ -80,11 +80,12 @@ final class TestPeer: @unchecked Sendable {
 
     func start() async throws -> String {
         listener.newConnectionHandler = { connection in
-            let (status, body) = self.responses[min(self.next, self.responses.count - 1)]
+            let index = self.next
             self.next += 1
             connection.start(queue: self.queue)
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { _, _, _, error in
-                guard error == nil else { connection.cancel(); return }
+                guard error == nil, !self.responses.isEmpty else { connection.cancel(); return }
+                let (status, body) = self.responses[min(index, self.responses.count - 1)]
                 let header = Data("HTTP/1.1 \(status) Test\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
                 connection.send(content: header, completion: .contentProcessed { error in
                     if error != nil { connection.cancel() }

@@ -174,7 +174,7 @@ func expectFailure(_ code: String, status: Int?,
         try await withPeer(responses) { source in
             let transport = try ClientTransport(origin: source.origin).withBearer(String(repeating: "a", count: 43))
             for status in statuses {
-                await expectFailure(status == 304 ? "invalid_response" : "moved", status: status) {
+                await expectFailure("invalid_response", status: status) {
                     let _: Payload = try await transport.invoke("notes.read", input: Empty())
                 }
             }

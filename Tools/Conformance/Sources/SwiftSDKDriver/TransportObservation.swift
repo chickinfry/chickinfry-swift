@@ -33,6 +33,7 @@ final class TransportObservation: @unchecked Sendable {
 
     func snapshot(_ id: String, after: Int) throws -> JSON {
         try lock.withLock {
+            guard after >= 0 else { throw ProtocolFailure.invalidArgs }
             guard let values = events[id], after <= sequence else { throw ProtocolFailure.invalidReference }
             return .object([
                 "callId": .string(id), "throughSequence": .int(sequence), "complete": .bool(true),

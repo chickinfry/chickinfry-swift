@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
   "driverVersion": "1.0.0",
-  "driverCommit": "003ec9d60d76ee8806ecf2ff42437745a702ab5b",
+  "driverCommit": "fc4161bcf3cfcacdef76f039560ca833bfbac14e",
   "build": {
     "tool": "swift",
     "entry": "Tools/Conformance/Package.swift",
