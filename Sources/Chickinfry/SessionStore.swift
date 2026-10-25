@@ -2,6 +2,8 @@ import Foundation
 
 /// An immutable session. Timestamps retain the server's original precision.
 public struct SessionRecord: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    var deviceGeneration: UInt64?
+    var deviceAuthGeneration: UInt64?
     /// The service origin this session authenticates against.
     public let origin: String
     /// The credential sent as the bearer token on protected requests.
@@ -53,6 +55,7 @@ struct SessionCredential: Hashable, Sendable {
 
 /// Wrappers of one physical record must share a coordinator and atomic conditional writes.
 /// Conditional writes compare the captured origin and both tokens atomically.
+/// Device adapters also compare the generation captured by load().
 /// Storage failures must throw; they must never be reported as an absent session or a mismatch.
 public protocol SessionStore: AnyObject, Sendable {
     /// The single origin this store is bound to; records from other origins must not be stored.
@@ -63,9 +66,9 @@ public protocol SessionStore: AnyObject, Sendable {
     func load() async throws -> SessionRecord?
     /// Makes the record available before returning; write failures throw.
     func save(_ session: SessionRecord) async throws
-    /// Returns true after replacement, false on a credential mismatch or absence; write failures throw.
+    /// Returns true after replacement, false on a stale captured record or absence; write failures throw.
     func replace(_ session: SessionRecord, ifMatching expected: SessionRecord) async throws -> Bool
-    /// Returns true after removal, false on a credential mismatch or absence; deletion failures throw.
+    /// Returns true after removal, false on a stale captured record or absence; deletion failures throw.
     func clear(ifMatching expected: SessionRecord) async throws -> Bool
 }
 
@@ -73,11 +76,26 @@ func sessionStoreCall<Value: Sendable>(
     _ operation: @Sendable () async throws -> Value
 ) async throws -> Value {
     do { return try await operation() }
+    catch let error as OperationError where DeviceLimits.errorCodes.contains(error.code) { throw error }
     catch { throw OperationError(code: "session_store_error", status: nil) }
 }
 
+protocol DeviceRefreshing: SessionStore {
+    func beginRefresh(ifMatching expected: SessionRecord) async throws -> Bool
+    func refreshCandidate(ifMatching expected: SessionRecord) async throws -> SessionRecord?
+}
+
+protocol DeviceAuthenticationStore: SessionStore {
+    func snapshot() async throws -> DeviceSnapshot
+    func snapshot(preparingAuthentication: Bool) async throws -> DeviceSnapshot
+    func rejectAuthentication(_ before: DeviceSnapshot) async throws
+    func install(_ session: SessionRecord, consumingEmail: String?, ifGeneration: UInt64,
+                 authGeneration: UInt64?) async throws -> Bool
+    func discardAttempt(_ attempt: DeviceAttempt, ifGeneration: UInt64) async throws -> Bool
+}
+
 func loadSession(_ store: any SessionStore, origin: String) async throws -> SessionRecord? {
-    let session = try await sessionStoreCall { try await store.load() }
+    let session = try await store.coordinator.current(store: store)
     guard store.origin == origin, session == nil || session?.origin == origin else {
         throw OperationError(code: "session_store_error", status: nil)
     }

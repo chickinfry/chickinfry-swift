@@ -4,6 +4,7 @@ import Foundation
 public struct OperationError: Error, Sendable, LocalizedError, CustomStringConvertible {
     public let code: String
     public let status: Int?
+    var devicePreparation = false
 
     public var errorDescription: String? { description }
 
@@ -17,6 +18,14 @@ public struct OperationError: Error, Sendable, LocalizedError, CustomStringConve
             "The access token is invalid. Sign in again before calling this operation."
         case "session_store_error":
             "The session store could not complete the operation. Check your session storage before trying again."
+        case "device_storage_unavailable":
+            "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off."
+        case "device_storage_corrupt":
+            "Stored session data could not be read. Sign out to clear it, then sign in again."
+        case "device_storage_full":
+            "Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again."
+        case "device_storage_version_unsupported":
+            "Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again."
         case "request_too_large":
             "The request exceeds 4 MiB. Reduce the input size before trying again."
         case "response_too_large":

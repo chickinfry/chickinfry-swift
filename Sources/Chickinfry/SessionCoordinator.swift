@@ -1,5 +1,11 @@
 import Foundation
 
+enum SessionCommit: Sendable {
+    case persisted
+    case stale
+    case memory(UInt64, local: UInt64)
+}
+
 /// Coordinates refresh for one storage unit, including credentials with an unknown consumption result.
 public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     private struct Flight {
@@ -14,6 +20,153 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
     }
     private var flights: [SessionCredential: Flight] = [:]
     private var uncertain: Set<SessionCredential> = []
+    private var volatileSession: SessionRecord?
+    private var volatileAuthGeneration: UInt64?
+    private var volatileLocalAuthGeneration: UInt64?
+    private var usesVolatileSession = false
+    private var mutationEpoch: UInt64 = 0
+
+    func authenticationSnapshot(_ snapshot: DeviceSnapshot) -> DeviceSnapshot {
+        var value = snapshot
+        if usesVolatileSession {
+            value.session = volatileSession
+            value.userID = volatileSession?.userID
+            value.sessionID = volatileSession?.sessionID
+            value.authGeneration = max(value.authGeneration, volatileAuthGeneration ?? 0)
+        }
+        return value
+    }
+
+    func authenticationGenerationFloor() -> UInt64 { volatileAuthGeneration ?? 0 }
+
+    func targetAuthenticationGeneration(_ snapshot: DeviceSnapshot, session: SessionRecord,
+                                         consuming: DeviceAttempt?) throws -> UInt64 {
+        let switches = snapshot.sessionID != session.sessionID
+        guard !switches || snapshot.authGeneration < UInt64.max else { throw deviceError("device_storage_full") }
+        return switches ? snapshot.authGeneration + 1 : snapshot.authGeneration
+    }
+
+    func commitAuthentication(_ session: SessionRecord, store: any DeviceAuthenticationStore,
+                               before: DeviceSnapshot, consuming: DeviceAttempt?, confirmedEmail: String?) async throws -> SessionCommit {
+        var latest = before
+        for _ in 0..<DeviceLimits.commitAttempts {
+            guard confirmationIsCurrent(latest, before: before, consuming: consuming) else {
+                try await discardConsumedAttempt(consuming, store: store)
+                return .stale
+            }
+            let generation = try targetAuthenticationGeneration(latest, session: session, consuming: consuming)
+            if try await store.install(session, consumingEmail: consuming?.email ?? confirmedEmail, ifGeneration: latest.generation,
+                                       authGeneration: generation) { return .persisted }
+            latest = try await store.snapshot()
+        }
+        guard confirmationIsCurrent(latest, before: before, consuming: consuming) else {
+            try await discardConsumedAttempt(consuming, store: store)
+            return .stale
+        }
+        return .memory(try targetAuthenticationGeneration(latest, session: session, consuming: consuming),
+                       local: latest.localAuthGeneration)
+    }
+
+    private func discardConsumedAttempt(_ attempt: DeviceAttempt?, store: any DeviceAuthenticationStore) async throws {
+        guard let attempt else { return }
+        do {
+            for _ in 0..<DeviceLimits.commitAttempts {
+                let snapshot = try await store.snapshot()
+                guard snapshot.attempts.contains(where: { $0.id == attempt.id && $0.screen == attempt.screen }) else { return }
+                if try await store.discardAttempt(attempt, ifGeneration: snapshot.generation) { return }
+            }
+        } catch {
+            var failure = (error as? OperationError) ?? deviceError()
+            failure.devicePreparation = true
+            throw failure
+        }
+    }
+
+    private func confirmationIsCurrent(_ latest: DeviceSnapshot, before: DeviceSnapshot,
+                                       consuming: DeviceAttempt?) -> Bool {
+        guard latest.authGeneration == before.authGeneration else { return false }
+        guard let consuming else { return true }
+        return latest.attempts.contains { $0.id == consuming.id && $0.screen == consuming.screen && $0.email == consuming.email }
+    }
+
+    func current(store: any SessionStore) async throws -> SessionRecord? {
+        if let device = store as? DeviceSessionStore { try await device.prepareInstallation() }
+        if usesVolatileSession {
+            if let device = store as? any DeviceAuthenticationStore {
+                do {
+                    let snapshot = try await device.snapshot()
+                    if let generation = volatileLocalAuthGeneration, snapshot.localAuthGeneration > generation {
+                        discardVolatileSession()
+                        return nil
+                    }
+                } catch let error as OperationError where error.code == "device_storage_unavailable" {
+                    // E1 remains usable when storage cannot report a newer authentication boundary.
+                }
+            }
+            return volatileSession
+        }
+        return try await sessionStoreCall { try await store.load() }
+    }
+
+    func discardVolatileSession() {
+        volatileSession = nil
+        volatileAuthGeneration = nil
+        volatileLocalAuthGeneration = nil
+        usesVolatileSession = false
+        mutationEpoch &+= 1
+    }
+
+    func acceptAuthenticated(_ session: SessionRecord, store: any SessionStore,
+                             expected: SessionRecord? = nil,
+                             authGeneration: UInt64? = nil, localAuthGeneration: UInt64? = nil, lateIsEmpty: Bool = false,
+                             persist: @Sendable () async throws -> SessionCommit) async throws -> SessionRecord? {
+        if let expected, usesVolatileSession {
+            guard try await current(store: store)?.credential == expected.credential else { return nil }
+            volatileSession = session
+            mutationEpoch &+= 1
+            return session
+        }
+        var epoch = mutationEpoch
+        var memoryGeneration = authGeneration ?? expected?.deviceAuthGeneration ?? 0
+        var memoryLocalGeneration = localAuthGeneration ?? expected?.deviceAuthGeneration ?? 0
+        do {
+            switch try await sessionStoreCall(persist) {
+            case .stale:
+                return lateIsEmpty ? nil : try await current(store: store)
+            case .persisted:
+                memoryLocalGeneration = memoryGeneration
+                if mutationEpoch == epoch { discardVolatileSession() }
+                epoch = mutationEpoch
+                return try await current(store: store)
+            case .memory(let generation, let local):
+                memoryGeneration = generation
+                memoryLocalGeneration = local
+            }
+        } catch let error as OperationError
+            where !error.devicePreparation && (error.code == "device_storage_unavailable" || error.code == "device_storage_full") {
+            _ = error
+        } catch {
+            discardVolatileSession()
+            throw error
+        }
+        guard mutationEpoch == epoch else { return lateIsEmpty ? nil : try await current(store: store) }
+        volatileSession = session
+        volatileAuthGeneration = memoryGeneration
+        volatileLocalAuthGeneration = memoryLocalGeneration
+        usesVolatileSession = true
+        mutationEpoch &+= 1
+        return session
+    }
+
+    private func clearAuthenticated(_ expected: SessionRecord, store: any SessionStore) async throws -> Bool {
+        if usesVolatileSession {
+            guard volatileSession?.credential == expected.credential else { return false }
+            volatileSession = nil
+            mutationEpoch &+= 1
+            return true
+        }
+        return try await sessionStoreCall { try await store.clear(ifMatching: expected) }
+    }
     #if CHICKINFRY_CONFORMANCE
     private var conformanceWork: [UUID: Task<Void, Never>] = [:]
     private var conformanceHooks: [UUID: Task<Void, any Error>] = [:]
@@ -42,6 +195,20 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
     public init() {}
 
     var waitingCount: Int { flights.values.reduce(0) { $0 + $1.waiters.count } }
+
+    private func commitRefresh(_ session: SessionRecord, expected: SessionRecord,
+                               store: any SessionStore) async throws -> SessionCommit {
+        guard let device = store as? any DeviceRefreshing else {
+            return try await store.replace(session, ifMatching: expected) ? .persisted : .stale
+        }
+        for _ in 0..<DeviceLimits.commitAttempts {
+            guard let current = try await device.refreshCandidate(ifMatching: expected) else { return .stale }
+            if try await store.replace(session, ifMatching: current) { return .persisted }
+        }
+        guard let current = try await device.refreshCandidate(ifMatching: expected),
+              let generation = current.deviceAuthGeneration else { return .stale }
+        return .memory(generation, local: generation)
+    }
 
     func refresh(expected: SessionRecord, store: any SessionStore,
                  perform: @escaping @Sendable () async throws -> SessionRecord) async throws -> SessionRecord? {
@@ -78,6 +245,10 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                             guard !self.uncertain.contains(key) else {
                                 throw OperationError(code: "invalid_token", status: 401)
                             }
+                            if !self.usesVolatileSession, let device = store as? any DeviceRefreshing {
+                                let claimed = try await sessionStoreCall { try await device.beginRefresh(ifMatching: expected) }
+                                guard claimed else { throw OperationError(code: "invalid_token", status: 401) }
+                            }
                             let refreshed: SessionRecord
                             do {
                                 #if CHICKINFRY_CONFORMANCE
@@ -90,7 +261,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                             }
                             catch let rejection as ServerRejection where rejection.error.status == 401 {
                                 unknown = true
-                                let removed = try await sessionStoreCall { try await store.clear(ifMatching: expected) }
+                                let removed = try await self.clearAuthenticated(expected, store: store)
                                 #if CHICKINFRY_CONFORMANCE
                                 Conformance.call?.clear(expected, removed)
                                 #endif
@@ -105,8 +276,9 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                                 throw error
                             }
                             unknown = true
-                            _ = try await sessionStoreCall { try await store.replace(refreshed, ifMatching: expected) }
-                            result = .success(try await loadSession(store, origin: expected.origin))
+                            result = .success(try await self.acceptAuthenticated(refreshed, store: store, expected: expected) {
+                                try await self.commitRefresh(refreshed, expected: expected, store: store)
+                            })
                             unknown = false
                         }
                     } catch { result = .failure(error) }

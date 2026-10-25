@@ -47,6 +47,34 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         return Self(origin: origin, timeout: timeout, bearer: nil, store: store)
     }
 
+    @_spi(DeviceStorage)
+    public func rejectAuthentication(_ before: DeviceSnapshot) async throws {
+        if let device = store as? any DeviceAuthenticationStore { try await device.rejectAuthentication(before) }
+    }
+
+    @_spi(DeviceStorage)
+    public func acceptSession(_ session: SessionRecord, after before: DeviceSnapshot,
+                               consuming attempt: DeviceAttempt? = nil,
+                               confirmedEmail: String? = nil) async throws -> SessionRecord {
+        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard let store else { return session }
+        var value = session
+        value.deviceGeneration = before.generation
+        value.deviceAuthGeneration = before.authGeneration
+        let accepted = value
+        let generation = try await store.coordinator.targetAuthenticationGeneration(before, session: session, consuming: attempt)
+        _ = try await store.coordinator.acceptAuthenticated(accepted, store: store, authGeneration: generation,
+                                                           localAuthGeneration: before.localAuthGeneration, lateIsEmpty: true) {
+            if let device = store as? any DeviceAuthenticationStore {
+                return try await store.coordinator.commitAuthentication(accepted, store: device, before: before,
+                                                                         consuming: attempt, confirmedEmail: confirmedEmail)
+            }
+            try await store.save(accepted)
+            return .persisted
+        }
+        return session
+    }
+
     static func validateToken(_ token: String) throws {
         guard token.utf8.count == 43,
               token.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
