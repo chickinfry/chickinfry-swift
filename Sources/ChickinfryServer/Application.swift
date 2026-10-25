@@ -34,34 +34,6 @@ public struct ServerResponse: Sendable {
     }
 }
 
-private struct InputFailure: Encodable {
-    struct Field: Encodable { let path: String; let code: String }
-    let error = "invalid_input"
-    let fields: [Field]
-}
-
-extension ServerResponse {
-    static func invalidInput(_ error: any Error) -> ServerResponse {
-        let path: [any CodingKey]
-        let code: String
-        switch error {
-        case DecodingError.keyNotFound(let key, let context):
-            path = context.codingPath + [key]; code = "required"
-        case DecodingError.valueNotFound(_, let context), DecodingError.typeMismatch(_, let context):
-            path = context.codingPath; code = "invalid_type"
-        default: return .failure("invalid_input", status: 400)
-        }
-        guard path.count == 1, let key = path.first?.stringValue, key.utf8.count <= 256,
-              let first = key.utf8.first, (97...122).contains(first),
-              key.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }),
-              !key.hasSuffix("_"), !key.contains("__"),
-              let data = try? JSONEncoder().encode(InputFailure(fields: [.init(path: key, code: code)])) else {
-            return .failure("invalid_input", status: 400)
-        }
-        return ServerResponse(status: 400, body: data)
-    }
-}
-
 public struct Operation: Sendable {
     let name: String
     let invoke: @Sendable (Data, RequestContext) async -> ServerResponse
@@ -74,7 +46,7 @@ public struct Operation: Sendable {
         invoke = { body, context in
             let value: Input
             do { value = try JSONDecoder().decode(Input.self, from: body) }
-            catch { return .invalidInput(error) }
+            catch { return .failure("invalid_input", status: 400) }
             do {
                 let output = try await handler(value, context)
                 return try ServerResponse(status: 200, body: JSONEncoder().encode(output))

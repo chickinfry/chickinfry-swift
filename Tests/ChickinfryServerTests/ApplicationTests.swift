@@ -32,8 +32,7 @@ private struct InternalFailure: Error {}
     ] {
         let result = await application.handle(operation, body: Data(body.utf8), context: context)
         #expect(result.status == status)
-        #expect(String(decoding: result.body, as: UTF8.self).contains(#""error":"\#(code)""#))
-        if status == 500 { #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8)) }
+        #expect(result.body == Data(#"{"error":"\#(code)"}"#.utf8))
     }
 }
 
@@ -50,17 +49,29 @@ private struct InternalFailure: Error {}
     #expect(try JSONDecoder().decode(Input.self, from: slowResult.body).value == "slow")
 }
 
-@Test func invalidFieldsUseDeclaredWireNamesWithoutReflectingValues() async throws {
-    struct Body: Decodable, Sendable { let item_id: String }
-    struct Failure: Decodable { struct Field: Decodable { let path: String; let code: String }; let fields: [Field] }
-    let application = Application(operations: [Operation("items.get", input: Body.self) { _, _ in Output(value: "ok") }])
+@Test func invalidInputOmitsFieldsAndSkipsHandler() async {
+    enum ItemID: String, Decodable, Sendable { case valid }
+    struct Body: Decodable, Sendable { let item_id: ItemID; let nested: Input? }
+    actor Calls {
+        var count = 0
+        func record() { count += 1 }
+    }
+    let calls = Calls()
+    let application = Application(operations: [Operation("items.get", input: Body.self) { _, _ in
+        await calls.record()
+        return Output(value: "ok")
+    }])
     let context = RequestContext(method: "POST", uri: "http://127.0.0.1/items.get", headers: [:])
-    for (body, code) in [("{}", "required"), (#"{"item_id":12,"private_marker":"never reflect"}"#, "invalid_type")] {
+    for body in [
+        "{}",
+        #"{"item_id":12,"private_marker":"never reflect"}"#,
+        #"{"item_id":null}"#,
+        #"{"item_id":"valid","nested":{"value":12}}"#,
+        #"{"item_id":"unknown"}"#,
+    ] {
         let response = await application.handle("items.get", body: Data(body.utf8), context: context)
-        let failure = try JSONDecoder().decode(Failure.self, from: response.body)
-        #expect(failure.fields.count == 1)
-        #expect(failure.fields[0].path == "item_id")
-        #expect(failure.fields[0].code == code)
-        #expect(!String(decoding: response.body, as: UTF8.self).contains("private_marker"))
+        #expect(response.status == 400)
+        #expect(response.body == Data(#"{"error":"invalid_input"}"#.utf8))
+        #expect(await calls.count == 0)
     }
 }
