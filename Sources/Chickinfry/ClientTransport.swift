@@ -64,7 +64,10 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         let accepted = value
         let generation = try await store.coordinator.targetAuthenticationGeneration(before, session: session, consuming: attempt)
         _ = try await store.coordinator.acceptAuthenticated(accepted, store: store, authGeneration: generation,
-                                                           localAuthGeneration: before.localAuthGeneration, lateIsEmpty: true) {
+                                                           localAuthGeneration: before.localAuthGeneration, lateIsEmpty: true,
+                                                           recovery: DeviceRecovery(before: before, writtenSession: accepted, writtenAuthGeneration: generation, session: accepted,
+                                                                                    authGeneration: generation, consuming: attempt,
+                                                                                    consumingEmail: attempt?.email ?? confirmedEmail, ownsRefresh: false)) {
             if let device = store as? any DeviceAuthenticationStore {
                 return try await store.coordinator.commitAuthentication(accepted, store: device, before: before,
                                                                          consuming: attempt, confirmedEmail: confirmedEmail)

@@ -15,9 +15,11 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     private(set) var probeAdds = 0
     private(set) var probeDeletes = 0
     private(set) var authenticationGroups: Set<String> = []
+    private(set) var callCount = 0
     var failure: Int32?
     var updateFailure: Int32?
     var failReadsAfterUpdate = false
+    var failAfterUpdating = false
     var deleteFailure: Int32?
     var crashAfterDeletes: Int?
     private var deletions = 0
@@ -45,6 +47,7 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     }
 
     func copy(_ query: [String: Any]) -> (Int32, Data?) {
+        callCount += 1
         if let failure { return (failure, nil) }
         do {
             let (files, name) = try files(query)
@@ -54,6 +57,7 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     }
 
     func add(_ query: [String: Any]) -> (Int32, String?) {
+        callCount += 1
         let service = query[kSecAttrService as String] as? String ?? ""
         if isProbe(service) { probeAdds += 1 }
         if let failure { return (failure, nil) }
@@ -69,12 +73,14 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     }
 
     func update(_ query: [String: Any], data: Data) -> Int32 {
+        callCount += 1
         if let updateFailure { return updateFailure }
         if let failure { return failure }
         do {
             let (files, name) = try files(query)
             guard try files.read(name) != nil else { return errSecItemNotFound }
             try files.write(name, data: data)
+            if failAfterUpdating { return errSecInteractionNotAllowed }
             if failReadsAfterUpdate { failure = errSecInteractionNotAllowed }
             return errSecSuccess
         } catch { return errSecInteractionNotAllowed }
@@ -88,6 +94,7 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     }
 
     func accounts(service: String, accessGroup: String) -> (Int32, [String]) {
+        callCount += 1
         if let failure { return (failure, []) }
         do {
             let (files, _) = try files([kSecAttrService as String: service, kSecAttrAccount as String: "unused",
@@ -103,6 +110,7 @@ final class FakeKeychainCalls: DeviceKeychainCalls, @unchecked Sendable {
     }
 
     func delete(service: String, account: String, accessGroup: String?) -> Int32 {
+        callCount += 1
         let probe = isProbe(service)
         if probe { probeDeletes += 1 }
         if let deleteFailure { return deleteFailure }

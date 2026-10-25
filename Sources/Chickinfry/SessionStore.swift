@@ -4,6 +4,7 @@ import Foundation
 public struct SessionRecord: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     var deviceGeneration: UInt64?
     var deviceAuthGeneration: UInt64?
+    var deviceRefreshRequestID: String?
     /// The service origin this session authenticates against.
     public let origin: String
     /// The credential sent as the bearer token on protected requests.
@@ -81,11 +82,12 @@ func sessionStoreCall<Value: Sendable>(
 }
 
 protocol DeviceRefreshing: SessionStore {
-    func beginRefresh(ifMatching expected: SessionRecord) async throws -> Bool
+    func beginRefresh(ifMatching expected: SessionRecord, requestID: String) async throws -> Bool
     func refreshCandidate(ifMatching expected: SessionRecord) async throws -> SessionRecord?
 }
 
 protocol DeviceAuthenticationStore: SessionStore {
+    func recover(_ recovery: DeviceRecovery, observing snapshot: DeviceSnapshot) async throws -> DeviceRecoveryResult
     func snapshot() async throws -> DeviceSnapshot
     func snapshot(preparingAuthentication: Bool) async throws -> DeviceSnapshot
     func rejectAuthentication(_ before: DeviceSnapshot) async throws

@@ -260,15 +260,20 @@ private actor RacingConfirmationStore: DeviceAuthenticationStore, DeviceRefreshi
     private(set) var installs = 0
     private var refreshRaces = 0
     private(set) var replacements = 0
+    private var beforeReplace: (@Sendable () throws -> Void)?
 
-    init(_ backing: DeviceSessionStore, refreshRaces: Int = 0) {
+    init(_ backing: DeviceSessionStore, refreshRaces: Int = 0, beforeReplace: (@Sendable () throws -> Void)? = nil) {
         self.backing = backing
         origin = backing.origin
         coordinator = backing.coordinator
         self.refreshRaces = refreshRaces
+        self.beforeReplace = beforeReplace
     }
 
     func snapshot() async throws -> DeviceSnapshot { try await backing.snapshot() }
+    func recover(_ recovery: DeviceRecovery, observing snapshot: DeviceSnapshot) async throws -> DeviceRecoveryResult {
+        return try await backing.recover(recovery, observing: snapshot)
+    }
     func snapshot(preparingAuthentication: Bool) async throws -> DeviceSnapshot {
         try await backing.snapshot(preparingAuthentication: preparingAuthentication)
     }
@@ -277,6 +282,10 @@ private actor RacingConfirmationStore: DeviceAuthenticationStore, DeviceRefreshi
     func save(_ session: SessionRecord) async throws { try await backing.save(session) }
     func replace(_ session: SessionRecord, ifMatching expected: SessionRecord) async throws -> Bool {
         replacements += 1
+        if let beforeReplace {
+            self.beforeReplace = nil
+            try beforeReplace()
+        }
         if refreshRaces > 0 {
             refreshRaces -= 1
             let current = try await backing.snapshot()
@@ -287,8 +296,8 @@ private actor RacingConfirmationStore: DeviceAuthenticationStore, DeviceRefreshi
         }
         return try await backing.replace(session, ifMatching: expected)
     }
-    func beginRefresh(ifMatching expected: SessionRecord) async throws -> Bool {
-        try await backing.beginRefresh(ifMatching: expected)
+    func beginRefresh(ifMatching expected: SessionRecord, requestID: String) async throws -> Bool {
+        try await backing.beginRefresh(ifMatching: expected, requestID: requestID)
     }
     func refreshCandidate(ifMatching expected: SessionRecord) async throws -> SessionRecord? {
         try await backing.refreshCandidate(ifMatching: expected)
@@ -395,7 +404,9 @@ func deviceVolatileSessionObservesExternalAuthenticationChange(mode: String) asy
             let before = try await backing.snapshot()
             let transport = try ClientTransport(origin: server.origin).withSession(racing)
             _ = try await transport.acceptSession(deviceRecord(origin: server.origin), after: before)
+            try FileManager.default.setAttributes([.posixPermissions: 0o722], ofItemAtPath: root.path)
             let activeBeforeChange = try await loadSession(racing, origin: server.origin) != nil
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
             #expect(activeBeforeChange)
             let process = try launchDeviceProbe(root: root, app: app, mode: mode, origin: server.origin)
             process.waitUntilExit()
@@ -424,8 +435,8 @@ func deviceVolatileSessionObservesExternalAuthenticationChange(mode: String) asy
     }
 }
 
-@Test(arguments: [0, 1, 3])
-func deviceRefreshPreservesAnotherScreensAttempt(races: Int) async throws {
+@Test(arguments: [0, 1, 3], [false, true])
+func deviceRefreshPreservesAnotherScreensAttempt(races: Int, newSession: Bool) async throws {
     try await withDeviceFixture { root, app in
         let store = try deviceStore(root, app)
         try await store.save(deviceRecord())
@@ -434,7 +445,8 @@ func deviceRefreshPreservesAnotherScreensAttempt(races: Int) async throws {
         let fresh = try deviceRecord()
         let replacement = try SessionRecord(origin: deviceOrigin, accessToken: fresh.accessToken,
             refreshToken: fresh.refreshToken, expiresAt: fresh.expiresAt,
-            refreshExpiresAt: fresh.refreshExpiresAt, userID: expected.userID, sessionID: expected.sessionID)
+            refreshExpiresAt: fresh.refreshExpiresAt, userID: expected.userID,
+            sessionID: newSession ? fresh.sessionID : expected.sessionID)
         let count = DeviceCount()
         let result = try await store.coordinator.refresh(expected: expected, store: racing) {
             await count.increment()
@@ -456,6 +468,8 @@ func deviceRefreshPreservesAnotherScreensAttempt(races: Int) async throws {
             let retained = try await loadSession(racing, origin: deviceOrigin)?.credential == replacement.credential
             #expect(retained)
         }
+        let generation = try await store.snapshot().localAuthGeneration
+        #expect(generation == (expected.deviceAuthGeneration ?? 0) + (newSession ? 1 : 0))
         #expect(try await store.attempt(screen: "other") != nil)
         #expect(await count.value == 1)
         #expect(await racing.replacements == min(races + 1, DeviceLimits.commitAttempts))
@@ -1126,6 +1140,520 @@ func deviceKeychainGroupConfirmationFailsBeforeAuthenticationStorage(kind: Strin
         let keychain = DeviceKeychain(service: "com.chickinfry.device." + app,
                                        account: UUID().uuidString, calls: calls)
         await deviceFailure("device_storage_unavailable") { try keychain.create(Data("non-secret".utf8)) }
+    }
+}
+
+private func rejoinRecord(matching session: SessionRecord) throws -> SessionRecord {
+    let fresh = try deviceRecord()
+    return try SessionRecord(origin: session.origin, accessToken: fresh.accessToken, refreshToken: fresh.refreshToken,
+                             expiresAt: fresh.expiresAt, refreshExpiresAt: fresh.refreshExpiresAt,
+                             userID: session.userID, sessionID: session.sessionID)
+}
+
+private func rejoinPeer(_ root: URL, _ app: String, _ change: (inout DeviceState) throws -> Void) throws {
+    let keychain = try fixtureKeychain(root, app)
+    var state = try JSONDecoder().decode(DeviceState.self, from: keychain.load())
+    try change(&state)
+    try state.advance()
+    try keychain.replace(state.encoded())
+}
+
+private func rejoinAttempt(screen: String, sequence: UInt64 = 1) -> DeviceAttempt {
+    let formatter = ISO8601DateFormatter()
+    return DeviceAttempt(id: UUID().uuidString, email: screen + "@example.test", screen: screen,
+                         acceptedAt: formatter.string(from: Date().addingTimeInterval(-1)),
+                         expiresAt: formatter.string(from: Date().addingTimeInterval(3600)), sequence: sequence)
+}
+
+private func rejoinRefreshMarker(_ root: URL, _ app: String, id: String?) throws {
+    let keychain = try fixtureKeychain(root, app)
+    var state = try #require(JSONSerialization.jsonObject(with: keychain.load()) as? [String: Any])
+    state["refreshRequestID"] = id
+    try keychain.replace(JSONSerialization.data(withJSONObject: state))
+}
+
+@Test(arguments: ["own", "peer", "legacy"])
+func deviceRejoinRefreshMarkerIdentity(kind: String) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let original = try #require(await store.load())
+        let replacement = try rejoinRecord(matching: original)
+        _ = try await store.coordinator.refresh(expected: original, store: store) {
+            calls.updateFailure = errSecInteractionNotAllowed
+            return replacement
+        }
+        let keychain = try fixtureKeychain(root, app)
+        let claim = try #require(JSONSerialization.jsonObject(with: keychain.load()) as? [String: Any])
+        let ownID = claim["refreshRequestID"] as? String
+        #expect(ownID.flatMap(UUID.init(uuidString:)) != nil)
+        calls.updateFailure = nil
+        let peerID = kind == "peer" ? UUID().uuidString : nil
+        if kind != "own" { try rejoinRefreshMarker(root, app, id: peerID) }
+        if kind == "own" {
+            let recovered = try await loadSession(store, origin: deviceOrigin)
+            #expect({ recovered?.credential == replacement.credential }())
+        } else {
+            do { #expect(try await loadSession(store, origin: deviceOrigin) == nil) }
+            catch let error as OperationError { #expect(error.code == "invalid_token") }
+        }
+        let result = try #require(JSONSerialization.jsonObject(with: keychain.load()) as? [String: Any])
+        #expect({ (result["refreshUncertain"] as? Bool) == (kind != "own") }())
+        #expect({ (result["refreshRequestID"] as? String) == peerID }())
+    }
+}
+
+@Test func deviceRejoinMarkerRoundTripAndPreChangeDecode() async throws {
+    let fixture = Data("""
+        {"version":1,"scope":{"origin":"https://device.example.test","app":"fixture","project":"project","environment":"test"},"installation":"11111111-1111-4111-8111-111111111111","generation":0,"authGeneration":0,"authenticationSwitches":[],"attempts":[],"refreshUncertain":false,"observedAt":0}
+        """.utf8)
+    let old = try JSONDecoder().decode(DeviceState.self, from: fixture)
+    #expect({ old.session == nil && old.attempts.isEmpty && old.authGeneration == 0 }())
+    _ = try old.encoded()
+    try await withDeviceFixture { root, app in
+        let store = try deviceStore(root, app, protected: true)
+        try await store.save(deviceRecord())
+        let session = try #require(await store.load())
+        #expect(try await store.beginRefresh(ifMatching: session))
+        let keychain = try fixtureKeychain(root, app)
+        let bytes = try keychain.load()
+        let original = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        let id = original["refreshRequestID"] as? String
+        #expect(id.flatMap(UUID.init(uuidString:)) != nil)
+        let decoded = try JSONDecoder().decode(DeviceState.self, from: bytes)
+        let encoded = try #require(JSONSerialization.jsonObject(with: decoded.encoded()) as? [String: Any])
+        #expect((encoded["refreshRequestID"] as? String) == id)
+        let reopened = try deviceStore(root, app, protected: true)
+        await deviceFailure("invalid_token") { _ = try await reopened.load() }
+    }
+}
+
+@Test func deviceRejoinRefreshCommitCannotClearAReplacedPeerMarker() async throws {
+    try await withDeviceFixture { root, app in
+        let store = try deviceStore(root, app, protected: true)
+        try await store.save(deviceRecord())
+        let original = try #require(await store.load())
+        let replacement = try rejoinRecord(matching: original)
+        let peerID = UUID().uuidString
+        let racing = RacingConfirmationStore(store, beforeReplace: { try rejoinRefreshMarker(root, app, id: peerID) })
+        do { #expect(try await store.coordinator.refresh(expected: original, store: racing) { replacement } == nil) }
+        catch let error as OperationError { #expect(error.code == "session_store_error") }
+        let raw = try #require(JSONSerialization.jsonObject(with: fixtureKeychain(root, app).load()) as? [String: Any])
+        #expect({ raw["refreshUncertain"] as? Bool == true }())
+        #expect({ raw["refreshRequestID"] as? String == peerID }())
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinRejectsInvalidRefreshMarkersWithoutChangingStorage(active: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let store = try deviceStore(root, app, protected: true)
+        try await store.save(deviceRecord())
+        let keychain = try fixtureKeychain(root, app)
+        var state = try #require(JSONSerialization.jsonObject(with: keychain.load()) as? [String: Any])
+        state["refreshUncertain"] = active
+        state["refreshRequestID"] = active ? "not-a-uuid" : UUID().uuidString
+        let damaged = try JSONSerialization.data(withJSONObject: state)
+        try keychain.replace(damaged)
+        await deviceFailure("device_storage_corrupt") { _ = try await store.load() }
+        let preserved = try keychain.load() == damaged
+        #expect(preserved)
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinPersistsOwnRefreshAndPreservesPeerAttemptDeletion(delete: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let original = rejoinAttempt(screen: "original")
+        try rejoinPeer(root, app) { $0.attempts = [original] }
+        let expected = try #require(await store.load())
+        let replacement = try rejoinRecord(matching: expected)
+        let count = DeviceCount()
+        _ = try await store.coordinator.refresh(expected: expected, store: store) {
+            await count.increment()
+            calls.updateFailure = errSecInteractionNotAllowed
+            return replacement
+        }
+        calls.updateFailure = nil
+        let peer = rejoinAttempt(screen: "peer", sequence: 20)
+        try rejoinPeer(root, app) {
+            if delete { $0.attempts = [] }
+            $0.attempts.append(peer)
+        }
+        let result = try await loadSession(store, origin: deviceOrigin)
+        #expect({ result?.credential == replacement.credential }())
+        let persisted = try await store.load()
+        #expect({ persisted?.credential == replacement.credential }())
+        let snapshot = try await store.snapshot()
+        #expect(Set(snapshot.attempts.map(\.id)) == Set(delete ? [peer.id] : [original.id, peer.id]))
+        #expect(await count.value == 1)
+    }
+}
+
+@Test(arguments: ["pending", "unknown", "rotated", "postcommit-rotated", "marker-rotated"])
+func deviceRejoinNeverUsesMemoryOverPeerAuthentication(kind: String) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let original = try #require(await store.load())
+        if kind == "marker-rotated" {
+            try rejoinPeer(root, app) {
+                $0.refreshUncertain = true
+                $0.refreshRequestID = UUID().uuidString
+            }
+        }
+        let before = try await store.snapshot()
+        let memory = try rejoinRecord(matching: original)
+        calls.failAfterUpdating = kind == "postcommit-rotated"
+        if !calls.failAfterUpdating { calls.updateFailure = errSecInteractionNotAllowed }
+        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        _ = try await transport.acceptSession(memory, after: before)
+        calls.failAfterUpdating = false
+        calls.updateFailure = nil
+        let peer = try rejoinRecord(matching: original)
+        let peerMarker = UUID().uuidString
+        try rejoinPeer(root, app) {
+            if kind == "marker-rotated" { $0.refreshRequestID = peerMarker }
+            else if kind == "pending" || kind == "marker-rotated" { $0.refreshUncertain = true }
+            else if kind == "unknown" {
+                $0.authenticationSwitches.append(.init(id: UUID().uuidString, generation: $0.authGeneration))
+            } else { $0.session = StoredSession(peer) }
+        }
+        if kind == "pending" || kind == "marker-rotated" {
+            await deviceFailure("invalid_token") { _ = try await loadSession(store, origin: deviceOrigin) }
+        } else {
+            let result = try await loadSession(store, origin: deviceOrigin)
+            if kind == "unknown" { #expect(result == nil) }
+            else { #expect({ result?.credential == peer.credential }()) }
+        }
+        let raw = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
+        if kind == "pending" || kind == "marker-rotated" { #expect({ raw.refreshUncertain }()) }
+        if kind == "marker-rotated" {
+            #expect({ raw.refreshRequestID == peerMarker }())
+            #expect({ raw.session?.accessToken == original.accessToken }())
+        } else if kind.contains("rotated") { #expect({ raw.session?.accessToken == peer.accessToken }()) }
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinOwnRefreshPreservesPeerPendingAndItsBlock(authChanged: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let original = try #require(await store.load())
+        let replacement = try rejoinRecord(matching: original)
+        _ = try await store.coordinator.refresh(expected: original, store: store) {
+            calls.updateFailure = errSecInteractionNotAllowed
+            return replacement
+        }
+        calls.updateFailure = nil
+        let pending = UUID().uuidString
+        try rejoinPeer(root, app) { $0.authenticationSwitches.append(.init(id: pending, generation: $0.authGeneration)) }
+        let result = try await loadSession(store, origin: deviceOrigin)
+        #expect(result == nil)
+        let raw = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
+        #expect({ raw.session?.accessToken == original.accessToken }())
+        #expect({ raw.refreshUncertain }())
+        #expect(raw.authenticationSwitches.map(\.id) == [pending])
+        let stillBlocked = try await loadSession(store, origin: deviceOrigin)
+        #expect(stillBlocked == nil)
+        let stored = try fixtureKeychain(root, app).load()
+        #expect(try await store.load() == nil)
+        #expect(try await store.snapshot().session == nil)
+        #expect(try fixtureKeychain(root, app).load() == stored)
+        calls.failure = errSecInteractionNotAllowed
+        #expect(try await loadSession(store, origin: deviceOrigin) == nil)
+        calls.failure = nil
+        try rejoinPeer(root, app) {
+            $0.authenticationSwitches = []
+            if authChanged {
+                try $0.advanceAuthentication()
+                $0.session = nil
+                $0.refreshUncertain = false
+                $0.refreshRequestID = nil
+            }
+        }
+        let afterPeerCompleted = try await loadSession(store, origin: deviceOrigin)
+        if authChanged { #expect(afterPeerCompleted == nil) }
+        else { #expect({ afterPeerCompleted?.credential == replacement.credential }()) }
+    }
+}
+
+@Test func deviceRejoinDoesNotSettleAnAppliedCandidateWithItsAuthenticationMark() async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let before = try await store.snapshot(preparingAuthentication: true)
+        let signedIn = try deviceRecord()
+        calls.updateFailure = errSecInteractionNotAllowed
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        calls.updateFailure = nil
+        try rejoinPeer(root, app) {
+            $0.session = StoredSession(signedIn)
+            $0.authGeneration = before.authGeneration + 1
+        }
+        let stored = try fixtureKeychain(root, app).load()
+        #expect(try await loadSession(store, origin: deviceOrigin) == nil)
+        #expect(try fixtureKeychain(root, app).load() == stored)
+        try rejoinPeer(root, app) { $0.authenticationSwitches = [] }
+        let settled = try await loadSession(store, origin: deviceOrigin)
+        #expect({ settled?.credential == signedIn.credential }())
+        #expect(try await store.snapshot().authGeneration == before.authGeneration + 1)
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinRecognizesAppliedAuthenticationAndKeepsPeerAttempts(peerChanged: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let before = try await store.snapshot()
+        let signedIn = try deviceRecord()
+        calls.failAfterUpdating = true
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        calls.failAfterUpdating = false
+        let peer = rejoinAttempt(screen: "peer")
+        if peerChanged { try rejoinPeer(root, app) { $0.attempts.append(peer) } }
+        let restored = try await loadSession(store, origin: deviceOrigin)
+        #expect({ restored?.credential == signedIn.credential }())
+        if peerChanged { #expect(try await store.attempt(screen: "peer")?.id == peer.id) }
+        let latest = try await store.snapshot()
+        let late = try deviceRecord()
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
+        let current = try await loadSession(store, origin: deviceOrigin)
+        #expect({ current?.credential == signedIn.credential }())
+        #expect(try await store.snapshot().authGeneration == latest.authGeneration)
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinAuthenticationPersistsConsumptionWithoutResurrectingPeerDeletes(peerRotated: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let consumed = rejoinAttempt(screen: "consumed")
+        let deleted = rejoinAttempt(screen: "deleted")
+        _ = try await store.snapshot()
+        try rejoinPeer(root, app) { $0.attempts = [consumed, deleted] }
+        let before = try await store.snapshot()
+        let session = try deviceRecord()
+        calls.updateFailure = errSecInteractionNotAllowed
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(session, after: before, consuming: consumed)
+        calls.updateFailure = nil
+        let peer = rejoinAttempt(screen: "peer", sequence: 20)
+        let peerSession = try rejoinRecord(matching: #require(before.session))
+        try rejoinPeer(root, app) {
+            $0.attempts = [consumed, peer]
+            if peerRotated { $0.session = StoredSession(peerSession) }
+        }
+        let expected = peerRotated ? peerSession : session
+        if peerRotated {
+            calls.updateFailure = errSecInteractionNotAllowed
+            #expect(try await loadSession(store, origin: deviceOrigin) == nil)
+            calls.updateFailure = nil
+        }
+        let result = try await loadSession(store, origin: deviceOrigin)
+        #expect({ result?.credential == expected.credential }())
+        let restored = try await store.load()
+        #expect({ restored?.credential == expected.credential }())
+        #expect(try await store.snapshot().attempts.map(\.id) == [peer.id])
+        if !peerRotated {
+            let late = try deviceRecord()
+            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
+            let afterLateReply = try await store.load()
+            #expect({ afterLateReply?.credential == session.credential }())
+        }
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinRecognizesItsLatestVolatileRefreshAfterAnUncertainRecoveryWrite(newSession: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let before = try await store.snapshot()
+        let signedIn = try deviceRecord()
+        calls.updateFailure = errSecInteractionNotAllowed
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        let memory = try #require(await loadSession(store, origin: deviceOrigin))
+        let beforeRefresh = try await store.snapshot()
+        let refreshed = try newSession ? deviceRecord() : rejoinRecord(matching: memory)
+        let count = DeviceCount()
+        _ = try await store.coordinator.refresh(expected: memory, store: store) {
+            await count.increment()
+            return refreshed
+        }
+        let afterRefresh = try await store.snapshot()
+        #expect(afterRefresh.authGeneration == beforeRefresh.authGeneration + (newSession ? 1 : 0))
+        if newSession {
+            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
+            let afterLateMemoryReply = try await loadSession(store, origin: deviceOrigin)
+            #expect({ afterLateMemoryReply?.credential == refreshed.credential }())
+        }
+        calls.updateFailure = nil
+        calls.failAfterUpdating = true
+        let uncertain = try await loadSession(store, origin: deviceOrigin)
+        #expect({ uncertain?.credential == refreshed.credential }())
+        calls.failAfterUpdating = false
+        let settled = try await loadSession(store, origin: deviceOrigin)
+        #expect({ settled?.credential == refreshed.credential }())
+        if newSession {
+            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
+            let afterLateReply = try await loadSession(store, origin: deviceOrigin)
+            #expect({ afterLateReply?.credential == refreshed.credential }())
+        }
+        #expect(await count.value == 1)
+        print("Keychain protocol fake calls: \(calls.callCount); real Keychain calls: 0 (protocol fake only)")
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinPreservesEarlierAppliedGenerationAfterVolatileRefresh(peerChanged: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let before = try await store.snapshot()
+        #expect(before.authGeneration == 1)
+        let signedIn = try deviceRecord()
+        calls.failAfterUpdating = true
+        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        calls.failAfterUpdating = false
+        let applied = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
+        #expect({ applied.session == StoredSession(signedIn) }())
+        #expect(applied.authGeneration == 2)
+        calls.failure = errSecInteractionNotAllowed
+        let memory = try #require(await loadSession(store, origin: deviceOrigin))
+        let refreshed = try deviceRecord()
+        let count = DeviceCount()
+        let duringFailure = try await store.coordinator.refresh(expected: memory, store: store) {
+            await count.increment()
+            return refreshed
+        }
+        #expect({ duringFailure?.credential == refreshed.credential }())
+        #expect(await store.coordinator.authenticationGenerationFloor() == 3)
+        calls.failure = nil
+        let peer = try deviceRecord()
+        if peerChanged { try rejoinPeer(root, app) { $0.session = StoredSession(peer) } }
+        let recovered = try await loadSession(store, origin: deviceOrigin)
+        #expect({ peerChanged ? recovered == nil : recovered?.credential == refreshed.credential }())
+        let next = try await loadSession(store, origin: deviceOrigin)
+        let expected = peerChanged ? peer : refreshed
+        #expect({ next?.credential == expected.credential }())
+        let final = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
+        #expect({ final.session == StoredSession(expected) }())
+        #expect(final.authGeneration == (peerChanged ? 2 : 3))
+        #expect(await count.value == 1)
+        print("Keychain protocol fake calls: \(calls.callCount); real Keychain calls: 0 (protocol fake only)")
+    }
+}
+
+@Test(arguments: [false, true])
+func deviceRejoinExplicitAuthenticationClearsObservedPeerMarks(cleanupFails: Bool) async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let signup = rejoinAttempt(screen: "signup")
+        let other = rejoinAttempt(screen: "other", sequence: 2)
+        try rejoinPeer(root, app) { $0.attempts = [signup, other] }
+        let peerBefore = try await store.snapshot(preparingAuthentication: true)
+        let original = try #require(await store.load())
+        let refreshed = try rejoinRecord(matching: original)
+        let count = DeviceCount()
+        _ = try await store.coordinator.refresh(expected: original, store: store) {
+            await count.increment()
+            calls.updateFailure = errSecInteractionNotAllowed
+            return refreshed
+        }
+        calls.updateFailure = nil
+        #expect(try await loadSession(store, origin: deviceOrigin) == nil)
+        let stored = try fixtureKeychain(root, app).load()
+        let beforeCleanup = try await store.snapshot()
+        #expect(beforeCleanup.state.authenticationSwitches.map(\.id) == [peerBefore.authenticationSwitchID])
+        if cleanupFails {
+            calls.updateFailure = errSecInteractionNotAllowed
+            do {
+                _ = try await store.snapshot(preparingAuthentication: true)
+                Issue.record("Expected authentication preparation to fail")
+            } catch let error as OperationError {
+                #expect(error.code == "device_storage_unavailable")
+                #expect(error.devicePreparation)
+            }
+            calls.updateFailure = nil
+            #expect(try fixtureKeychain(root, app).load() == stored)
+            #expect(try await loadSession(store, origin: deviceOrigin) == nil)
+        }
+        let before = try await store.snapshot(preparingAuthentication: true)
+        #expect(before.session == nil)
+        #expect({ before.state.session == nil }())
+        #expect({ before.state.authenticationSwitches.isEmpty }())
+        #expect({ !before.state.refreshUncertain }())
+        #expect({ before.state.refreshRequestID == nil }())
+        #expect(before.authGeneration == beforeCleanup.authGeneration + 1)
+        #expect(await store.coordinator.authenticationGenerationFloor() == 0)
+        #expect(before.attempts.map(\.id) == [signup.id, other.id])
+        #expect(try await store.attempt(screen: signup.screen)?.id == signup.id)
+        #expect(try await store.attempt(screen: other.screen)?.id == other.id)
+        let signedIn = try deviceRecord()
+        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        _ = try await transport.acceptSession(signedIn, after: before)
+        _ = try await transport.acceptSession(deviceRecord(), after: peerBefore)
+        let result = try await loadSession(store, origin: deviceOrigin)
+        #expect({ result?.credential == signedIn.credential }())
+        let current = try await store.snapshot()
+        #expect(current.authGeneration == before.authGeneration + 1)
+        #expect(current.state.authenticationSwitches.isEmpty)
+        #expect(current.attempts.map(\.id) == [signup.id, other.id])
+        #expect(try await store.refreshCandidate(ifMatching: original) == nil)
+        #expect(await count.value == 1)
+    }
+}
+
+@Test func deviceRejoinPlainLoadKeepsRestartCleanup() async throws {
+    try await withDeviceFixture { root, app in
+        let store = try deviceStore(root, app, protected: true)
+        try await store.save(deviceRecord())
+        let generation = try await store.snapshot().authGeneration
+        try rejoinPeer(root, app) { $0.authenticationSwitches.append(.init(id: UUID().uuidString, generation: $0.authGeneration)) }
+        #expect(try await store.load() == nil)
+        let state = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
+        #expect({ state.session == nil && state.authenticationSwitches.isEmpty && state.authGeneration == generation + 1 }())
+    }
+}
+
+@Test func deviceRejoinLogoutFailureRemainsBlocked() async throws {
+    try await withDeviceFixture { root, app in
+        let calls = FakeKeychainCalls(root: root)
+        let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
+                                           persist: .dir(root.path), keychainCalls: calls, protected: true)
+        try await store.save(deviceRecord())
+        let before = try await store.snapshot()
+        calls.updateFailure = errSecInteractionNotAllowed
+        await deviceFailure("device_storage_unavailable") { _ = try await store.logout(ifGeneration: before.generation) }
+        calls.updateFailure = nil
+        try rejoinPeer(root, app) { $0.attempts.append(rejoinAttempt(screen: "peer")) }
+        await deviceFailure("device_storage_unavailable") { _ = try await loadSession(store, origin: deviceOrigin) }
     }
 }
 

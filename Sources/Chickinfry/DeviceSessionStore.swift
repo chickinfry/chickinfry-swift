@@ -53,6 +53,7 @@ public struct DeviceSnapshot: Sendable, CustomStringConvertible, CustomDebugStri
     var userID: String?
     var sessionID: String?
     var authenticationSwitchID: String?
+    let state: DeviceState
     public var description: String { "DeviceSnapshot" }
     public var debugDescription: String { description }
     public var customMirror: Mirror { Mirror(self, children: EmptyCollection<Mirror.Child>()) }
@@ -86,7 +87,7 @@ public struct DeviceAttempt: Codable, Sendable, CustomStringConvertible, CustomD
     }
 }
 
-struct StoredSession: Codable {
+struct StoredSession: Codable, Equatable, Sendable {
     let origin: String
     let accessToken: String
     let refreshToken: String
@@ -115,8 +116,8 @@ struct StoredSession: Codable {
     }
 }
 
-struct DeviceState: Codable {
-    struct AuthenticationSwitch: Codable { let id: String; let generation: UInt64 }
+struct DeviceState: Codable, Sendable {
+    struct AuthenticationSwitch: Codable, Equatable, Sendable { let id: String; let generation: UInt64 }
     var version = 1
     let scope: DeviceScope
     let installation: String?
@@ -126,6 +127,7 @@ struct DeviceState: Codable {
     var session: StoredSession?
     var attempts: [DeviceAttempt] = []
     var refreshUncertain = false
+    var refreshRequestID: String?
     var observedAt: Int64 = 0
 
     mutating func advance() throws {
@@ -150,6 +152,9 @@ struct DeviceState: Codable {
         guard observedAt >= 0, session != nil || !refreshUncertain,
               session?.origin == nil || session?.origin == scope.origin,
               Set(attempts.map(\.screen)).count == attempts.count else { throw deviceError("device_storage_corrupt") }
+        if let refreshRequestID {
+            guard refreshUncertain, UUID(uuidString: refreshRequestID) != nil else { throw deviceError("device_storage_corrupt") }
+        }
         guard Set(authenticationSwitches.map(\.id)).count == authenticationSwitches.count,
               authenticationSwitches.allSatisfy({ UUID(uuidString: $0.id) != nil && $0.generation <= authGeneration }) else {
             throw deviceError("device_storage_corrupt")
@@ -223,6 +228,8 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     private let usesKeychain: Bool
     private var memory: DeviceState
     private var boundInstallation: String?
+    private var rejoinSwitches: Set<String> = []
+    private var rejoinAuthGeneration: UInt64?
 
     public init(origin: String, app: String, project: String, environment: String, persist: Persist? = nil) throws {
         try self.init(origin: origin, app: app, project: project, environment: environment,
@@ -272,13 +279,17 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
 
     public func snapshot(preparingAuthentication: Bool) async throws -> DeviceSnapshot {
         do {
-        let snapshot = try transaction { state in
+        let floor = await coordinator.authenticationGenerationFloor()
+        let prepared = try transaction { state in
             var changed = false
-            if preparingAuthentication, state.authenticationSwitches.contains(where: { !context.knowsSwitch($0.id) }) {
+            let clearsPeer = preparingAuthentication && (recoveryBlocked(state)
+                || state.authenticationSwitches.contains(where: { !context.knowsSwitch($0.id) }))
+            if clearsPeer {
                 state.session = nil
                 state.authenticationSwitches = []
                 state.refreshUncertain = false
-                try state.advanceAuthentication()
+                state.refreshRequestID = nil
+                try state.advanceAuthentication(after: floor)
                 try state.advance()
                 changed = true
             }
@@ -289,15 +300,16 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 try state.advance()
                 changed = true
             }
-            let session = state.refreshUncertain ? nil : try state.session?.restore(generation: state.generation,
-                                                                                    authGeneration: state.authGeneration)
-            return (DeviceSnapshot(generation: state.generation, authGeneration: state.authGeneration,
-                                   localAuthGeneration: state.authGeneration,
-                                   session: session, attempts: state.attempts, userID: state.session?.userID,
-                                   sessionID: state.session?.sessionID, authenticationSwitchID: switchID), changed)
+            return ((state: state, switchID: switchID, clearsPeer: clearsPeer), changed)
         }
+        if prepared.clearsPeer {
+            rejoinSwitches = []
+            rejoinAuthGeneration = nil
+            await coordinator.discardVolatileSession()
+        }
+        let snapshot = try snapshotValue(prepared.state, switchID: prepared.switchID)
         if let id = snapshot.authenticationSwitchID { context.rememberSwitch(id) }
-        return await coordinator.authenticationSnapshot(snapshot)
+        return try await coordinator.authenticationSnapshot(snapshot, store: self)
         } catch {
             guard preparingAuthentication else { throw error }
             if let error = error as? OperationError,
@@ -344,16 +356,111 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
 
     public func load() async throws -> SessionRecord? {
         try transaction { state in
+            if recoveryBlocked(state) { return (nil, false) }
             if state.authenticationSwitches.contains(where: { !context.knowsSwitch($0.id) }) {
                 state.session = nil
                 state.authenticationSwitches = []
                 state.refreshUncertain = false
+                state.refreshRequestID = nil
                 try state.advanceAuthentication()
                 try state.advance()
                 return (nil, true)
             }
             guard !state.refreshUncertain else { throw OperationError(code: "invalid_token", status: 401) }
             return (try state.session?.restore(generation: state.generation, authGeneration: state.authGeneration), false)
+        }
+    }
+
+    private func recoveryBlocked(_ state: DeviceState) -> Bool {
+        if rejoinAuthGeneration != state.authGeneration { rejoinSwitches = [] }
+        rejoinSwitches.formIntersection(state.authenticationSwitches.map(\.id))
+        if rejoinSwitches.isEmpty { rejoinAuthGeneration = nil }
+        return !rejoinSwitches.isEmpty
+    }
+
+    private func snapshotValue(_ state: DeviceState, switchID: String? = nil) throws -> DeviceSnapshot {
+        let blocked = recoveryBlocked(state)
+        let session = state.refreshUncertain || blocked ? nil
+            : try state.session?.restore(generation: state.generation, authGeneration: state.authGeneration)
+        return DeviceSnapshot(generation: state.generation, authGeneration: state.authGeneration,
+                              localAuthGeneration: state.authGeneration, session: session, attempts: state.attempts,
+                              userID: state.session?.userID, sessionID: state.session?.sessionID,
+                              authenticationSwitchID: switchID, state: state)
+    }
+
+    func recover(_ recovery: DeviceRecovery, observing snapshot: DeviceSnapshot) async throws -> DeviceRecoveryResult {
+        var pending = recovery
+        var observed = snapshot
+        func applied(_ state: DeviceState) -> Bool {
+            state.authGeneration == pending.writtenAuthGeneration && state.session == StoredSession(pending.writtenSession)
+                && !state.refreshUncertain
+                && !state.authenticationSwitches.contains(where: { $0.id == pending.before.authenticationSwitchID })
+        }
+        func classify(_ state: DeviceState) -> Bool {
+            let base = pending.before.state
+            guard state.scope == base.scope, state.installation == base.installation,
+                  applied(state) || state.authGeneration == base.authGeneration else { return false }
+            if !applied(state) {
+                let switchID = pending.before.authenticationSwitchID
+                let ownsSwitch = switchID == nil || state.authenticationSwitches.contains(where: { $0.id == switchID })
+                let ownsAttempt = pending.consuming == nil || state.attempts.contains(where: {
+                    $0.id == pending.consuming?.id && $0.screen == pending.consuming?.screen
+                })
+                let ownsRefresh = !pending.ownsRefresh || (pending.refreshRequestID != nil
+                    && state.refreshRequestID == pending.refreshRequestID)
+                let sameRefresh = pending.ownsRefresh || state.refreshRequestID == base.refreshRequestID
+                if state.session != base.session || state.refreshUncertain != (pending.ownsRefresh || base.refreshUncertain)
+                    || !ownsSwitch || !ownsAttempt
+                    || !ownsRefresh || !sameRefresh {
+                    pending.installsSession = false
+                }
+            }
+            let peers = state.authenticationSwitches.filter { $0.id != pending.before.authenticationSwitchID }
+            rejoinSwitches = Set(peers.map(\.id))
+            rejoinAuthGeneration = state.authGeneration
+            return true
+        }
+        guard classify(snapshot.state) else { return .stale(snapshot) }
+        do {
+            return try transaction { state in
+                observed = try snapshotValue(state)
+                guard classify(state) else { return (.stale(observed), false) }
+                observed = try snapshotValue(state)
+                let reflected = applied(state)
+                let sameSession = state.session == StoredSession(pending.session)
+                let consumes = pending.consumingEmail.map { email in state.attempts.contains { $0.email == email } } ?? false
+                if pending.installsSession, recoveryBlocked(state), !(reflected && sameSession) {
+                    return (.memory(observed, blocked: true, recovery: pending), false)
+                }
+                if !pending.installsSession && !consumes { return (.stale(observed), false) }
+                if reflected && sameSession && !consumes { return (.settled(observed), false) }
+                if pending.installsSession {
+                    if reflected {
+                        // Rebase only after the complete credential transition proves our previous write applied.
+                        pending.before = observed
+                        pending.ownsRefresh = false
+                        pending.consuming = nil
+                        pending.consumingEmail = nil
+                    }
+                    state.authGeneration = pending.authGeneration
+                    state.session = StoredSession(pending.session)
+                    state.refreshUncertain = false
+                    state.refreshRequestID = nil
+                    state.authenticationSwitches.removeAll { $0.id == pending.before.authenticationSwitchID }
+                    pending.writtenSession = pending.session
+                    pending.writtenAuthGeneration = pending.authGeneration
+                }
+                // Only consumption changes attempts locally; preserve peer additions and deletions.
+                if let email = recovery.consumingEmail { state.attempts.removeAll { $0.email == email } }
+                try state.advance()
+                try state.prune(now: Int64(Date().timeIntervalSince1970))
+                return (.settled(try snapshotValue(state)), true)
+            }
+        } catch let error as OperationError
+            where error.code == "device_storage_unavailable" || error.code == "device_storage_full" {
+            let blocked = !pending.installsSession || recoveryBlocked(observed.state)
+                || (observed.state.refreshUncertain && !pending.ownsRefresh)
+            return .memory(observed, blocked: blocked, recovery: pending)
         }
     }
 
@@ -365,6 +472,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             state.session = StoredSession(session)
             state.authenticationSwitches = []
             state.refreshUncertain = false
+            state.refreshRequestID = nil
             return ((), true)
         }
         await coordinator.discardVolatileSession()
@@ -378,6 +486,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             try state.advance()
             state.session = StoredSession(session)
             state.refreshUncertain = false
+            state.refreshRequestID = nil
             return (true, true)
         }
         if replaced { await coordinator.discardVolatileSession() }
@@ -394,6 +503,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 state.session = nil
                 state.authenticationSwitches = []
                 state.refreshUncertain = false
+                state.refreshRequestID = nil
                 return (true, true)
             }
             if removed { await coordinator.discardVolatileSession() }
@@ -406,9 +516,14 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     }
 
     public func beginRefresh(ifMatching expected: SessionRecord) async throws -> Bool {
+        try await beginRefresh(ifMatching: expected, requestID: UUID().uuidString)
+    }
+
+    func beginRefresh(ifMatching expected: SessionRecord, requestID: String) async throws -> Bool {
         try transaction { state in
             guard !state.refreshUncertain, try matches(state, expected) else { return (false, false) }
             state.refreshUncertain = true
+            state.refreshRequestID = requestID
             return (true, true)
         }
     }
@@ -416,9 +531,12 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     func refreshCandidate(ifMatching expected: SessionRecord) async throws -> SessionRecord? {
         try transaction { state in
             guard state.refreshUncertain, state.authGeneration == expected.deviceAuthGeneration,
+                  let requestID = expected.deviceRefreshRequestID, state.refreshRequestID == requestID,
                   let current = try state.session?.restore(generation: state.generation, authGeneration: state.authGeneration),
                   current.credential == expected.credential else { return (nil, false) }
-            return (current, false)
+            var candidate = current
+            candidate.deviceRefreshRequestID = requestID
+            return (candidate, false)
         }
     }
 
@@ -437,6 +555,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             state.session = StoredSession(session)
             state.authenticationSwitches = []
             state.refreshUncertain = false
+            state.refreshRequestID = nil
             if let consumingEmail { state.attempts.removeAll { $0.email == consumingEmail } }
             return (true, true)
         }
@@ -455,6 +574,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 state.authenticationSwitches = []
                 state.attempts = []
                 state.refreshUncertain = false
+                state.refreshRequestID = nil
                 return (true, true)
             }
             if removed { await coordinator.discardVolatileSession() }
@@ -506,6 +626,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
 
     private func matches(_ state: DeviceState, _ expected: SessionRecord) throws -> Bool {
         guard expected.deviceGeneration == nil || expected.deviceGeneration == state.generation else { return false }
+        guard expected.deviceRefreshRequestID == nil || expected.deviceRefreshRequestID == state.refreshRequestID else { return false }
         return try state.session?.restore(generation: state.generation).credential == expected.credential
     }
 
