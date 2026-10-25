@@ -1,16 +1,109 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { WASI } from "node:wasi";
+import { createHash } from "node:crypto";
 
-const module = new WebAssembly.Module(fs.readFileSync(process.argv[2]));
+const artifact = fs.readFileSync(process.argv[2]);
+const module = new WebAssembly.Module(artifact);
+function artifactABI(bytes) {
+  let position = 8;
+  const byte = () => bytes[position++];
+  const integer = () => {
+    let result = 0, shift = 0, value;
+    do { value = byte(); result += (value & 127) * 2 ** shift; shift += 7; } while (value & 128);
+    return result;
+  };
+  const name = () => { const size = integer(); const value = bytes.subarray(position, position + size).toString("utf8"); position += size; return value; };
+  const vector = (read) => Array.from({ length: integer() }, read);
+  const scalar = () => ({ 127: "i32", 126: "i64", 125: "f32", 124: "f64", 123: "v128", 112: "funcref", 111: "externref" })[byte()];
+  const types = [], functions = [], imports = [], exports = [];
+  while (position < bytes.length) {
+    const section = byte(), end = integer() + position;
+    if (section === 1) types.push(...vector(() => {
+      assert.equal(byte(), 96);
+      return { parameters: vector(scalar), results: vector(scalar) };
+    }));
+    if (section === 2) imports.push(...vector(() => {
+      const module = name(), field = name();
+      assert.equal(byte(), 0, "probe imports must be functions");
+      const type = integer(); functions.push(type);
+      return { module, name: field, ...types[type] };
+    }));
+    if (section === 3) functions.push(...vector(integer));
+    if (section === 7) exports.push(...vector(() => {
+      const field = name(), kind = byte(), index = integer();
+      return { name: field, kind, ...(kind === 0 ? types[functions[index]] : {}) };
+    }));
+    position = end;
+  }
+  return { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length, imports, exports };
+}
+console.log("artifact ABI:", JSON.stringify(artifactABI(artifact)));
 const wasi = new WASI({ version: "preview1", args: [], env: {}, preopens: {} });
 let instance;
 let nextCall = 1;
 const pending = new Map();
-const range = (pointer, size) => new Uint8Array(instance.exports.memory.buffer, pointer >>> 0, size >>> 0);
+const resources = new Map();
+const finished = [];
+let logs = 0, databaseCalls = 0;
+const range = (pointer, size) => {
+  const memory = instance.exports.memory.buffer, start = pointer >>> 0;
+  assert.ok(size >= 0 && start <= memory.byteLength - size, "range must use current memory and remain in bounds");
+  return new Uint8Array(memory, start, size);
+};
+const encoder = new TextEncoder();
+function hostResult(id, value) {
+  const bytes = encoder.encode(JSON.stringify(value));
+  const pointer = instance.exports.chik_allocate(bytes.length);
+  try {
+    range(pointer, bytes.length).set(bytes);
+    instance.exports.chik_host_result(id, 1, pointer, bytes.length);
+  } finally { instance.exports.chik_deallocate(pointer); }
+}
+function hostCall(channel, id, pointer, size) {
+  const copy = range(pointer, size).slice();
+  instance.exports.memory.grow(1);
+  const frame = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(copy));
+  const state = resources.get(frame.rid);
+  assert.ok(state, "host authority must belong to a live rid");
+  if (channel === 3) {
+    if (frame.cancel) state.stopping = true;
+    Promise.all([...state.pending]).then(() => {
+      assert.equal(state.ports, 0, "finish cannot acknowledge a live port");
+      resources.delete(frame.rid);
+      finished.push({ rid: frame.rid, cancelled: frame.cancel, calls: state.calls });
+      hostResult(id, {});
+    });
+    return;
+  }
+  assert.equal(state.stopping, false, "new I/O after cancellation is forbidden");
+  const operation = (async () => {
+    if (channel === 1) { assert.equal(frame.name, "probe"); return { value: "environment" }; }
+    if (channel === 2) { assert.equal(frame.message, "Probe log"); logs++; return {}; }
+    assert.equal(channel, 0);
+    databaseCalls++; state.calls++;
+    if (frame.op === "query") {
+      state.ports++;
+      try {
+        if (frame.sql !== "fast") await new Promise((resolve) => setTimeout(resolve, 40));
+        return state.stopping ? { error: "database_failed" } : { rows: [{ value: `db:${frame.sql}` }] };
+      } finally { state.ports--; }
+    }
+    if (frame.op === "begin") { state.lease = 2 ** 32 + id; return { lease: state.lease }; }
+    assert.equal(frame.op, "commit"); assert.equal(frame.lease, state.lease);
+    instance.exports.chik_commit_observed(id, 2, 1);
+    return {};
+  })();
+  state.pending.add(operation);
+  operation.then((value) => {
+    hostResult(id, value);
+    hostResult(id, { error: "database_failed" });
+  }).finally(() => state.pending.delete(operation));
+}
 const imports = {
   "wasi_snapshot_preview1": wasi.wasiImport,
   "chik-swift:1": {
+    host_call: hostCall,
     enqueue(job, delay) {
       const run = () => instance.exports.chik_run_job(job);
       if (delay === 0) queueMicrotask(run);
@@ -37,10 +130,12 @@ function wait(id, start) {
 const boot = await wait(0, () => assert.doesNotThrow(() => instance.exports.probe_boot(), "WASM bootstrap must use the Swift calling convention"));
 assert.equal(boot.status, 200);
 console.log("bootstrap: passed");
-const encoder = new TextEncoder();
-async function call(mode, value) {
+async function call(mode, value, options = {}) {
   const id = nextCall++;
-  const metadata = encoder.encode(JSON.stringify({ operation: "probe.run", context: { method: "POST", uri: "http://127.0.0.1/probe.run", headers: {} } }));
+  const host = ["db", "env", "transaction", "cancel"].includes(mode);
+  const rid = host ? 2 ** 32 + id : undefined;
+  if (host) resources.set(rid, { pending: new Set(), ports: 0, stopping: false, calls: 0 });
+  const metadata = encoder.encode(JSON.stringify({ operation: "probe.run", context: { method: "POST", uri: "http://127.0.0.1/probe.run", headers: {} }, rid, deadlineMilliseconds: options.deadlineMilliseconds }));
   const body = encoder.encode(JSON.stringify({ mode, value }));
   const response = await wait(id, () => {
     const frame = instance.exports.chik_allocate(metadata.length);
@@ -48,11 +143,16 @@ async function call(mode, value) {
     try {
       range(frame, metadata.length).set(metadata); range(input, body.length).set(body);
       instance.exports.probe_handle(id, frame, metadata.length, input, body.length);
+      if (options.cancel) instance.exports.chik_cancel(id);
     } finally { instance.exports.chik_deallocate(frame); instance.exports.chik_deallocate(input); }
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, options.status ?? 200);
+  if (response.status !== 200) {
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { error: "operation_failed" });
+    return;
+  }
   const output = JSON.parse(new TextDecoder().decode(response.body));
-  assert.equal(output.value, value);
+  assert.equal(output.value, mode === "db" ? `db:${value}` : mode === "env" ? "environment" : value);
   assert.equal(output.setupCount, 1);
 }
 await call("fast", "first");
@@ -69,3 +169,19 @@ for (const mode of ["legacy", "duration", "main"]) {
 const outputs = await Promise.all([call("duration", "slow"), call("fast", "fast"), call("legacy", "other")]);
 assert.equal(outputs.length, 3);
 console.log("request isolation and setup once: passed");
+const order = [];
+const delayedDB = call("db", "slow").then(() => order.push("slow"));
+await call("db", "fast"); order.push("fast");
+await delayedDB;
+assert.deepEqual(order, ["fast", "slow"]);
+await call("env", "unused"); assert.equal(logs, 1);
+await call("transaction", "committed");
+const beforeCancellation = databaseCalls;
+await call("cancel", "never sent", { cancel: true, status: 500 });
+assert.equal(databaseCalls, beforeCancellation, "cancellation before registration must prevent I/O");
+const concurrentDB = call("db", "other request");
+await call("db", "late result", { deadlineMilliseconds: 5, status: 500 });
+await concurrentDB;
+assert.equal(resources.size, 0);
+assert.equal(finished.filter((entry) => entry.cancelled).length, 2);
+console.log("host db/env/log, safe rid/lease, one-shot results, memory growth, deadline and shared-instance cancellation: passed");

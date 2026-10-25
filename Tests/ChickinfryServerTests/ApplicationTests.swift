@@ -15,6 +15,7 @@ private struct InternalFailure: Error {}
         Operation("echo.call", input: Input.self) { input, _ in Output(value: input.value) },
         Operation("echo.missing", input: Input.self) { _, _ -> Output in throw OperationError.notImplemented },
         Operation("echo.failed", input: Input.self) { _, _ -> Output in throw InternalFailure() },
+        Operation("echo.databaseFailed", input: Input.self) { _, _ -> Output in throw HostFailure(code: "commit_unknown") },
     ])
     let context = RequestContext(method: "POST", uri: "http://127.0.0.1/echo.call", headers: [:])
     let response = await application.handle("echo.call", body: Data(#"{"value":"한글 🐔"}"#.utf8), context: context)
@@ -26,6 +27,7 @@ private struct InternalFailure: Error {}
         ("echo.call", "[]", 400, "invalid_input"),
         ("echo.missing", #"{"value":"x"}"#, 501, "not_implemented"),
         ("echo.failed", #"{"value":"x"}"#, 500, "operation_failed"),
+        ("echo.databaseFailed", #"{"value":"x"}"#, 500, "operation_failed"),
         ("echo.unknown", "{}", 404, "not_found"),
     ] {
         let result = await application.handle(operation, body: Data(body.utf8), context: context)
