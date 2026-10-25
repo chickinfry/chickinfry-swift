@@ -136,7 +136,7 @@ async function call(mode, value, options = {}) {
   const rid = host ? 2 ** 32 + id : undefined;
   if (host) resources.set(rid, { pending: new Set(), ports: 0, stopping: false, calls: 0 });
   const metadata = encoder.encode(JSON.stringify({ operation: "probe.run", context: { method: "POST", uri: "http://127.0.0.1/probe.run", headers: {} }, rid, deadlineMilliseconds: options.deadlineMilliseconds }));
-  const body = encoder.encode(JSON.stringify({ mode, value }));
+  const body = options.body instanceof Uint8Array ? options.body : encoder.encode(options.body ?? JSON.stringify({ mode, value }));
   const response = await wait(id, () => {
     const frame = instance.exports.chik_allocate(metadata.length);
     const input = instance.exports.chik_allocate(body.length);
@@ -148,7 +148,7 @@ async function call(mode, value, options = {}) {
   });
   assert.equal(response.status, options.status ?? 200);
   if (response.status !== 200) {
-    assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { error: "operation_failed" });
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { error: options.error ?? "operation_failed" });
     return;
   }
   const output = JSON.parse(new TextDecoder().decode(response.body));
@@ -157,6 +157,33 @@ async function call(mode, value, options = {}) {
 }
 await call("fast", "first");
 console.log("fast: passed");
+const beforeInvalidInput = databaseCalls;
+for (const [name, body, error] of [
+  ["depth 65", '{"mode":"db","value":"blocked","ignored":' + "[".repeat(64) + "null" + "]".repeat(64) + "}", "invalid_input"],
+  ["invalid JSON", '{"mode":"db","value":"blocked",}', "invalid_json"],
+  ["invalid UTF-8", new Uint8Array([123, 34, 255, 34, 58, 48, 125]), "invalid_json"],
+  ["positive overflow", '{"mode":"db","value":"blocked","ignored":1e999}', "invalid_input"],
+  ["negative overflow", '{"mode":"db","value":"blocked","ignored":-1e999}', "invalid_input"],
+  ["duplicate key", '{"mode":"db","value":"blocked","ignored":0,"ignored":1}', "invalid_input"],
+  ["nested duplicate key", '{"mode":"db","value":"blocked","ignored":{"x":0,"x":1}}', "invalid_input"],
+  ["escaped duplicate key", '{"mode":"db","value":"blocked","ign\\u006fred":0,"ignored":1}', "invalid_input"],
+  ["unpaired surrogate value", '{"mode":"db","value":"blocked","ignored":"\\uD800"}', "invalid_input"],
+  ["unpaired surrogate key", '{"mode":"db","value":"blocked","ignored":{"\\uDC00":0}}', "invalid_input"],
+  ["syntax after duplicate key", '{"mode":"db","value":"blocked","ignored":0,"ignored":1}!', "invalid_json"],
+  ["syntax after surrogate", '{"mode":"db","value":"blocked","ignored":"\\uD800"}!', "invalid_json"],
+  ["unclosed depth 65", "[".repeat(65), "invalid_json"],
+  ["bad token after depth 65", "[".repeat(65) + "null" + "]".repeat(65) + "!", "invalid_json"],
+]) {
+  await call("db", "blocked", { body, status: 400, error });
+  assert.equal(databaseCalls, beforeInvalidInput, "invalid input must not reach the database handler");
+  console.log(`request structure ${name}: passed`);
+}
+await call("fast", "finite", { body: '{"mode":"fast","value":"finite","ignored":1e308}' });
+await call("fast", "depth64", { body: '{"mode":"fast","value":"depth64","ignored":' + "[".repeat(63) + "null" + "]".repeat(63) + "}" });
+await call("fast", "brackets", { body: JSON.stringify({ mode: "fast", value: "brackets", ignored: "[{".repeat(65) }) });
+await call("fast", "surrogates", { body: '{"mode":"fast","value":"surrogates","ignored":"\\uD834\\uDD1E"}' });
+await call("fast", "shallow", { body: '{"mode":"fast","value":"shallow","ignored":[' + "null,".repeat(100000) + 'null]}' });
+console.log("request structure finite number, depth 64, string brackets, surrogate pair and large shallow array: passed");
 for (const mode of ["legacy", "duration", "main"]) {
   const order = [];
   const delayed = call(mode, mode).then(() => order.push("delayed"));
