@@ -1,7 +1,24 @@
 @_spi(Generated) import ChickinfryServer
 import FoundationEssentials
 
-private struct Input: Decodable, Sendable { let mode: String; let value: String }
+private enum ProbeFailure: Error { case invalid }
+private struct RawKeys: Decodable, Sendable {
+    private struct Key: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    init(from decoder: any Decoder) throws {
+        let object = try decoder.container(keyedBy: Key.self)
+        if object.contains(Key(stringValue: "budget")) { throw _InputBudgetExceeded() }
+        guard object.allKeys.map({ Array($0.stringValue.utf8) }) == [[195, 169], [101, 204, 129], [99, 97, 102, 101, 204, 129]],
+              try object.decode(Int.self, forKey: Key(stringValue: "é")) == 1,
+              try object.decode(Int.self, forKey: Key(stringValue: "e\u{0301}")) == 2,
+              !object.contains(Key(stringValue: "café")) else { throw ProbeFailure.invalid }
+    }
+}
+private struct Input: Decodable, Sendable { let mode: String; let value: String; let keys: RawKeys? }
 private struct Output: Encodable, Sendable { let value: String; let setupCount: Int }
 private struct Query: Encodable { let op = "query"; let sql: String; let params: [String] = [] }
 private struct Rows: Decodable { struct Row: Decodable { let value: String }; let rows: [Row] }
@@ -38,6 +55,14 @@ public func probeBoot() {
         }
         return Output(value: value, setupCount: await SetupState.shared.count)
     }]), setup: {
+        _ = try _decodeJSON(RawKeys.self, from: #"{"\u00e9":1,"e\u0301":2,"cafe\u0301":3}"#)
+        for token in ["1e20", "-0", "9007199254740993", "9223372036854775807", "9223372036854775808", "1e-999", "4.9406564584124654e-324"] {
+            guard (try? _decodeJSON(Int.self, from: token)) == (try? JSONDecoder().decode(Int.self, from: Data(token.utf8))),
+                  (try? _decodeJSON(Int32.self, from: token)) == (try? JSONDecoder().decode(Int32.self, from: Data(token.utf8))),
+                  (try? _decodeJSON(Int64.self, from: token)) == (try? JSONDecoder().decode(Int64.self, from: Data(token.utf8))),
+                  (try? _decodeJSON(Double.self, from: token))?.bitPattern == (try? JSONDecoder().decode(Double.self, from: Data(token.utf8)))?.bitPattern
+            else { throw ProbeFailure.invalid }
+        }
         await SetupState.shared.prepare()
         return ApplicationOptions()
     })

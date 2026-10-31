@@ -10,6 +10,119 @@ private struct Input: Decodable, Sendable { let value: String }
 private struct Output: Encodable, Sendable { let value: String }
 private struct InternalFailure: Error {}
 
+private struct ObjectProbe: Decodable, Sendable {
+    struct Key: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    let keys: [[UInt8]]
+    let values: [Int]
+
+    init(from decoder: any Decoder) throws {
+        let object = try decoder.container(keyedBy: Key.self)
+        keys = object.allKeys.map { Array($0.stringValue.utf8) }
+        values = try object.allKeys.map { try object.decode(Int.self, forKey: $0) }
+    }
+}
+
+@Test private func rawObjectKeysRemainDistinct() async {
+    let application = Application(operations: [Operation("keys.inspect", input: ObjectProbe.self) { input, _ in
+        #expect(input.keys == [[195, 169], [101, 204, 129]])
+        #expect(input.values == [1, 2])
+        return Output(value: "ok")
+    }])
+    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/keys.inspect", headers: [:])
+    for body in [#"{"é":1,"e\u0301":2}"#, #"{"\u00e9":1,"é":2}"#] {
+        let response = await application.handle("keys.inspect", body: Data(body.utf8), context: context)
+        #expect(response.status == 200)
+    }
+}
+
+@Test private func declaredKeyDoesNotMatchCanonicalTwin() throws {
+    struct Declared: Decodable { let café: Int? }
+    #expect(try _decodeJSON(Declared.self, from: #"{"cafe\u0301":2}"#).café == nil)
+    #expect(try _decodeJSON(Declared.self, from: #"{"caf\u00e9":3}"#).café == 3)
+}
+
+@Test(arguments: ["0", "-0", "1.0", "1e2", "1e20", "1e21", "1e-6", "1e-7", "1e-999", "0e999",
+                  "2147483647", "2147483648", "-2147483649", "9007199254740993", "9223372036854775807",
+                  "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
+                  "18446744073709551615", "18446744073709551616", "4.9406564584124654e-324",
+                  "1.7976931348623157e308", "1e999", "3.4028236e38", "1.0000000000000001"])
+private func rawNumbersMatchFoundation(_ token: String) throws {
+    func check<T: Decodable & Equatable>(_ type: T.Type) {
+        #expect((try? _decodeJSON(type, from: token)) == (try? JSONDecoder().decode(type, from: Data(token.utf8))))
+    }
+    check(Int.self)
+    check(Int32.self)
+    check(Int64.self)
+    check(UInt64.self)
+    check(Double.self)
+    check(Float.self)
+    if token == "-0" { #expect(try _decodeJSON(Double.self, from: token).sign == .minus) }
+    if let parsed = try? JSONBody.parse(Data(token.utf8), requireObject: false), case .number(let original) = parsed {
+        #expect(original == token)
+    }
+}
+
+@Test private func rawDecoderHandlesNestedValuesAndErrorPaths() throws {
+    struct Row: Decodable, Equatable { let value: String?; let count: Int32 }
+    struct Body: Decodable { let rows: [Row?]; let missing: Bool?; let flag: Bool }
+    let decoded = try _decodeJSON(Body.self, from: #"{"rows":[null,{"value":null,"count":1},{"value":"\uD834\uDD1E","count":2}],"flag":true}"#)
+    #expect(decoded.rows == [nil, Row(value: nil, count: 1), Row(value: "𝄞", count: 2)])
+    #expect(decoded.missing == nil)
+    #expect(decoded.flag)
+    for literal in [#"{"rows":[{"value":42,"count":1}],"flag":true}"#,
+                    #"{"rows":[{"value":"ok","count":2147483648}],"flag":true}"#] {
+        do {
+            _ = try _decodeJSON(Body.self, from: literal)
+            Issue.record("Invalid nested value decoded")
+        } catch DecodingError.typeMismatch(_, let context) {
+            #expect(context.codingPath.map(\.stringValue) == ["rows", "Index 0", "value"])
+            #expect(context.codingPath[1].intValue == 0)
+        } catch DecodingError.dataCorrupted(let context) {
+            #expect(context.codingPath.map(\.stringValue) == ["rows", "Index 0", "count"])
+        }
+    }
+}
+
+@Test private func rawDecoderSupportsExplicitNestedContainers() throws {
+    struct Nested: Decodable {
+        let value: Int
+        init(from decoder: any Decoder) throws {
+            let object = try decoder.container(keyedBy: ObjectProbe.Key.self)
+            #expect(object.allKeys.map(\.stringValue) == ["é", "e\u{0301}"])
+            let first = try object.nestedContainer(keyedBy: ObjectProbe.Key.self, forKey: .init(stringValue: "é"))
+            #expect(first.codingPath.map(\.stringValue) == ["é"])
+            #expect(try first.decode(Int.self, forKey: .init(stringValue: "value")) == 1)
+            var array = try object.nestedUnkeyedContainer(forKey: .init(stringValue: "e\u{0301}"))
+            #expect(array.count == 4)
+            #expect(try array.decodeNil())
+            #expect(try !array.decodeNil())
+            #expect(try array.decode(Bool.self))
+            let second = try array.nestedContainer(keyedBy: ObjectProbe.Key.self)
+            #expect(second.codingPath.map(\.stringValue) == ["e\u{0301}", "Index 2"])
+            value = try second.decode(Int.self, forKey: .init(stringValue: "value"))
+            var nested = try array.nestedUnkeyedContainer()
+            #expect(try nested.decode(String.self) == "ok")
+            #expect(nested.isAtEnd)
+            #expect(array.isAtEnd)
+        }
+    }
+    #expect(try _decodeJSON(Nested.self, from: #"{"é":{"value":1},"e\u0301":[null,true,{"value":2},["ok"]]}"#).value == 2)
+}
+
+@Test private func rawDecoderIndexesLargeShallowObjects() throws {
+    let literal = "{" + (0..<20000).map { "\"key\($0)\":\($0)" }.joined(separator: ",") + "}"
+    let decoded = try _decodeJSON(ObjectProbe.self, from: literal)
+    #expect(decoded.keys.count == 20000)
+    #expect(decoded.keys.first == Array("key0".utf8))
+    #expect(decoded.keys.last == Array("key19999".utf8))
+    #expect(decoded.values == Array(0..<20000))
+}
+
 @Test func dispatchValidatesAndMasksFailures() async throws {
     let application = Application(operations: [
         Operation("echo.call", input: Input.self) { input, _ in Output(value: input.value) },

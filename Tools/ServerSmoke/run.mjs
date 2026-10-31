@@ -38,7 +38,10 @@ function artifactABI(bytes) {
   }
   return { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length, imports, exports };
 }
-console.log("artifact ABI:", JSON.stringify(artifactABI(artifact)));
+const abi = artifactABI(artifact);
+assert.equal(abi.imports.length, 35);
+assert.equal(abi.exports.length, 10);
+console.log("artifact ABI:", JSON.stringify(abi));
 const wasi = new WASI({ version: "preview1", args: [], env: {}, preopens: {} });
 let instance;
 let nextCall = 1;
@@ -157,6 +160,11 @@ async function call(mode, value, options = {}) {
 }
 await call("fast", "first");
 console.log("fast: passed");
+await call("fast", "keys", { body: '{"mode":"fast","value":"keys","keys":{"é":1,"e\\u0301":2,"cafe\\u0301":3}}' });
+await call("fast", "escaped keys", { body: '{"mode":"fast","value":"escaped keys","keys":{"\\u00e9":1,"é":2,"café":3}}' });
+await call("fast", "invalid keys", { body: '{"mode":"fast","value":"invalid keys","keys":{"é":1,"é":9,"café":3}}', status: 400, error: "invalid_input" });
+await call("fast", "budget", { body: '{"mode":"fast","value":"budget","keys":{"budget":0}}', status: 413, error: "request_too_large" });
+console.log("byte-exact keys, default literal SPI, Foundation numeric parity, 400 and 413: passed");
 const beforeInvalidInput = databaseCalls;
 for (const [name, body, error] of [
   ["depth 65", '{"mode":"db","value":"blocked","ignored":' + "[".repeat(64) + "null" + "]".repeat(64) + "}", "invalid_input"],
@@ -173,6 +181,8 @@ for (const [name, body, error] of [
   ["syntax after surrogate", '{"mode":"db","value":"blocked","ignored":"\\uD800"}!', "invalid_json"],
   ["unclosed depth 65", "[".repeat(65), "invalid_json"],
   ["bad token after depth 65", "[".repeat(65) + "null" + "]".repeat(65) + "!", "invalid_json"],
+  ["depth 20000", '{"mode":"db","value":"blocked","ignored":' + "[".repeat(20000) + "null" + "]".repeat(20000) + "}", "invalid_input"],
+  ["bad token after depth 20000", "[".repeat(20000) + "!", "invalid_json"],
 ]) {
   await call("db", "blocked", { body, status: 400, error });
   assert.equal(databaseCalls, beforeInvalidInput, "invalid input must not reach the database handler");
@@ -184,6 +194,7 @@ await call("fast", "brackets", { body: JSON.stringify({ mode: "fast", value: "br
 await call("fast", "surrogates", { body: '{"mode":"fast","value":"surrogates","ignored":"\\uD834\\uDD1E"}' });
 await call("fast", "shallow", { body: '{"mode":"fast","value":"shallow","ignored":[' + "null,".repeat(100000) + 'null]}' });
 console.log("request structure finite number, depth 64, string brackets, surrogate pair and large shallow array: passed");
+console.log("WASM linear memory after large shallow array:", instance.exports.memory.buffer.byteLength);
 for (const mode of ["legacy", "duration", "main"]) {
   const order = [];
   const delayed = call(mode, mode).then(() => order.push("delayed"));
