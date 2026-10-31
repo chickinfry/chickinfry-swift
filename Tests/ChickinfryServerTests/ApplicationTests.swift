@@ -28,7 +28,7 @@ private struct ObjectProbe: Decodable, Sendable {
 }
 
 @Test private func rawObjectKeysRemainDistinct() async {
-    let application = Application(operations: [Operation("keys.inspect", input: ObjectProbe.self) { input, _ in
+    let application = Application(operations: [Operation("keys.inspect", input: ObjectProbe.self) { _, input in
         #expect(input.keys == [[195, 169], [101, 204, 129]])
         #expect(input.values == [1, 2])
         return Output(value: "ok")
@@ -125,7 +125,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
 
 @Test func dispatchValidatesAndMasksFailures() async throws {
     let application = Application(operations: [
-        Operation("echo.call", input: Input.self) { input, _ in Output(value: input.value) },
+        Operation("echo.call", input: Input.self) { _, input in Output(value: input.value) },
         Operation("echo.missing", input: Input.self) { _, _ -> Output in throw OperationError.notImplemented },
         Operation("echo.failed", input: Input.self) { _, _ -> Output in throw InternalFailure() },
         Operation("echo.databaseFailed", input: Input.self) { _, _ -> Output in throw HostFailure(code: "commit_unknown") },
@@ -150,7 +150,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
 }
 
 @Test func suspendedRequestsKeepTheirOwnValues() async throws {
-    let application = Application(operations: [Operation("echo.call", input: Input.self) { input, _ in
+    let application = Application(operations: [Operation("echo.call", input: Input.self) { _, input in
         if input.value == "slow" { try await Task.sleep(nanoseconds: 30_000_000) }
         return Output(value: input.value)
     }])
@@ -394,7 +394,7 @@ private func malformedJSONSkipsHandler(_ body: String) async {
         func record() { count += 1 }
     }
     let calls = Calls()
-    let application = Application(operations: [Operation("echo.call", input: Input.self) { input, _ in
+    let application = Application(operations: [Operation("echo.call", input: Input.self) { _, input in
         await calls.record()
         return Output(value: input.value)
     }])
@@ -409,4 +409,50 @@ private func malformedJSONSkipsHandler(_ body: String) async {
     #expect(rejected.status == 413)
     #expect(rejected.body == Data(#"{"error":"request_too_large"}"#.utf8))
     #expect(await calls.count == 1)
+}
+
+@Test(arguments: [400, 422, 501, 599, 399, 600])
+private func businessErrorsValidateAtResponseBoundary(_ status: Int) async {
+    let failure = OperationError(code: "x", status: status, message: "Public detail",
+                                 fields: [FieldError(path: "value", code: "required")])
+    #expect(failure.code == "x")
+    #expect(failure.status == status)
+    #expect(failure.responseMessage == "Public detail")
+    #expect(failure.fields.first?.path == "value")
+    #expect(failure.fields.first?.code == "required")
+    let application = Application(operations: [Operation("echo.call", input: Input.self) { context, input -> Output in
+        #expect(context.uri == "/echo.call")
+        #expect(input.value == "received")
+        throw failure
+    }])
+    let result = await application.handle("echo.call", body: Data(#"{"value":"received"}"#.utf8),
+                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+    let valid = (400...599).contains(status)
+    #expect(result.status == (valid ? status : 500))
+    #expect(result.body == Data((valid ? #"{"error":"x"}"# : #"{"error":"operation_failed"}"#).utf8))
+}
+
+@Test(arguments: ["X", String(repeating: "x", count: 65), "x\n", "", "x1", "é", "x\"", String(repeating: "_", count: 64)])
+private func businessErrorCodesMatchEntireASCIIString(_ code: String) async {
+    let application = Application(operations: [Operation("echo.call", input: Input.self) { _, _ -> Output in
+        throw OperationError(code: code, status: 422)
+    }])
+    let result = await application.handle("echo.call", body: Data(#"{"value":"ok"}"#.utf8),
+                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+    let valid = code == String(repeating: "_", count: 64)
+    #expect(result.status == (valid ? 422 : 500))
+    #expect(result.body == Data((valid ? "{\"error\":\"\(code)\"}" : #"{"error":"operation_failed"}"#).utf8))
+}
+
+@Test private func outputEncodingDoesNotExposeBusinessErrors() async {
+    struct FailingOutput: Encodable, Sendable {
+        func encode(to encoder: any Encoder) throws {
+            throw OperationError(code: "x", status: 422)
+        }
+    }
+    let application = Application(operations: [Operation("echo.call", input: Input.self) { _, _ in FailingOutput() }])
+    let result = await application.handle("echo.call", body: Data(#"{"value":"ok"}"#.utf8),
+                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+    #expect(result.status == 500)
+    #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8))
 }

@@ -20,9 +20,30 @@ public struct ApplicationOptions: Sendable {
     public init() {}
 }
 
+public struct FieldError: Sendable {
+    public let path: String
+    public let code: String
+
+    public init(path: String, code: String) {
+        self.path = path
+        self.code = code
+    }
+}
+
 public struct OperationError: Error, Sendable {
-    public static let notImplemented = OperationError()
-    private init() {}
+    public let code: String
+    public let status: Int
+    public let responseMessage: String?
+    public let fields: [FieldError]
+
+    public init(code: String, status: Int, message: String? = nil, fields: [FieldError] = []) {
+        self.code = code
+        self.status = status
+        self.responseMessage = message
+        self.fields = fields
+    }
+
+    public static let notImplemented = OperationError(code: "not_implemented", status: 501)
 }
 
 @_spi(Generated)
@@ -45,7 +66,7 @@ public struct Operation: Sendable {
 
     public init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
         _ name: String, input: Input.Type,
-        handler: @escaping @Sendable (Input, RequestContext) async throws -> Output
+        handler: @escaping @Sendable (RequestContext, Input) async throws -> Output
     ) {
         self.name = name
         invoke = { body, context in
@@ -53,11 +74,20 @@ public struct Operation: Sendable {
             do { value = try Input(from: JSONValueDecoder(body)) }
             catch is _InputBudgetExceeded { return .failure("request_too_large", status: 413) }
             catch { return .failure("invalid_input", status: 400) }
+            let output: Output
             do {
-                let output = try await handler(value, context)
+                output = try await handler(context, value)
+            } catch let error as OperationError {
+                guard (400...599).contains(error.status), (1...64).contains(error.code.utf8.count),
+                      error.code.utf8.allSatisfy({ (97...122).contains($0) || $0 == 95 }) else {
+                    return .failure("operation_failed", status: 500)
+                }
+                return .failure(error.code, status: error.status)
+            } catch {
+                return .failure("operation_failed", status: 500)
+            }
+            do {
                 return try ServerResponse(status: 200, body: JSONEncoder().encode(output))
-            } catch is OperationError {
-                return .failure("not_implemented", status: 501)
             } catch {
                 return .failure("operation_failed", status: 500)
             }

@@ -33,7 +33,7 @@ private actor SetupState {
 
 @_cdecl("probe_boot")
 public func probeBoot() {
-    WasmServer.start(Application(operations: [Operation("probe.run", input: Input.self) { input, _ in
+    WasmServer.start(Application(operations: [Operation("probe.run", input: Input.self) { _, input in
         var value = input.value
         switch input.mode {
         case "legacy": try await Task.sleep(nanoseconds: 30_000_000)
