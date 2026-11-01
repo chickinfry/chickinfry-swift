@@ -13,11 +13,11 @@ final class SecretValues: @unchecked Sendable {
 actor ObservedStore: SessionStore {
     nonisolated let origin: String
     nonisolated let coordinator: SessionCoordinator
-    let backing: MemorySessionStore
+    let backing: MemoryStore
     nonisolated let trace = SessionTrace()
 
     init(origin: String) throws {
-        let backing = try MemorySessionStore(origin: origin)
+        let backing = try MemoryStore(origin: origin)
         self.backing = backing
         self.origin = backing.origin
         self.coordinator = backing.coordinator

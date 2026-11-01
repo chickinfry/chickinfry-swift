@@ -23,11 +23,11 @@ public struct SessionRecord: Sendable, CustomStringConvertible, CustomDebugStrin
     /// Validates the origin, credentials, and required fields without changing timestamp precision.
     public init(origin: String, accessToken: String, refreshToken: String, expiresAt: String,
                 refreshExpiresAt: String, userID: String, sessionID: String) throws {
-        self.origin = try ClientTransport.validateOrigin(origin)
-        try ClientTransport.validateToken(accessToken)
-        try ClientTransport.validateToken(refreshToken)
+        self.origin = try HTTPTransport.validateOrigin(origin)
+        try HTTPTransport.validateToken(accessToken)
+        try HTTPTransport.validateToken(refreshToken)
         guard !expiresAt.isEmpty, !refreshExpiresAt.isEmpty, !userID.isEmpty, !sessionID.isEmpty else {
-            throw OperationError(code: "invalid_input", status: nil)
+            throw ClientError(code: "invalid_input", status: nil)
         }
         self.accessToken = accessToken
         self.refreshToken = refreshToken
@@ -77,8 +77,8 @@ func sessionStoreCall<Value: Sendable>(
     _ operation: @Sendable () async throws -> Value
 ) async throws -> Value {
     do { return try await operation() }
-    catch let error as OperationError where DeviceLimits.errorCodes.contains(error.code) { throw error }
-    catch { throw OperationError(code: "session_store_error", status: nil) }
+    catch let error as ClientError where DeviceLimits.errorCodes.contains(error.reason) { throw error }
+    catch { throw ClientError(code: "session_store_error", status: nil) }
 }
 
 protocol DeviceRefreshing: SessionStore {
@@ -99,7 +99,7 @@ protocol DeviceAuthenticationStore: SessionStore {
 func loadSession(_ store: any SessionStore, origin: String) async throws -> SessionRecord? {
     let session = try await store.coordinator.current(store: store)
     guard store.origin == origin, session == nil || session?.origin == origin else {
-        throw OperationError(code: "session_store_error", status: nil)
+        throw ClientError(code: "session_store_error", status: nil)
     }
     return session
 }

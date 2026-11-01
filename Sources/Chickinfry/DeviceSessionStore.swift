@@ -181,11 +181,11 @@ private struct DeviceIdentity: Codable {
 private final class DeviceContext: @unchecked Sendable {
     let coordinator = SessionCoordinator()
     private let lock = NSLock()
-    private var blocked: OperationError?
+    private var blocked: ClientError?
     private var installation: String?
     private var liveSwitches: Set<String> = []
     func check() throws { try lock.withLock { if let blocked { throw blocked } } }
-    func block(_ error: OperationError) {
+    func block(_ error: ClientError) {
         var blockedError = error
         blockedError.devicePreparation = true
         lock.withLock { blocked = blockedError }
@@ -238,10 +238,10 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
 
     init(origin: String, app: String, project: String, environment: String, persist: Persist?,
          keychainCalls: (any DeviceKeychainCalls)?, protected: Bool? = nil) throws {
-        self.origin = try ClientTransport.validateOrigin(origin)
+        self.origin = try HTTPTransport.validateOrigin(origin)
         for component in [app, project, environment] {
             guard validDeviceComponent(component) else {
-                throw OperationError(code: "invalid_input", status: nil)
+                throw ClientError(code: "invalid_input", status: nil)
             }
         }
         scope = DeviceScope(origin: self.origin, app: app, project: project, environment: environment)
@@ -312,8 +312,8 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
         return try await coordinator.authenticationSnapshot(snapshot, store: self)
         } catch {
             guard preparingAuthentication else { throw error }
-            if let error = error as? OperationError,
-               error.code == "device_storage_corrupt" || error.code == "device_storage_version_unsupported" { throw error }
+            if let error = error as? ClientError,
+               error.reason == "device_storage_corrupt" || error.reason == "device_storage_version_unsupported" { throw error }
             var failure = deviceError()
             failure.devicePreparation = true
             throw failure
@@ -347,7 +347,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
         let id = try DeviceInstallation(app: scope.app, files: files,
                                          calls: keychainCalls ?? SystemDeviceKeychainCalls()).prepare()
         guard boundInstallation == nil || boundInstallation == id else {
-            throw OperationError(code: "invalid_token", status: nil)
+            throw ClientError(code: "session_changed", status: nil)
         }
         boundInstallation = id
         return (id, context.bindInstallation(id))
@@ -366,7 +366,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 try state.advance()
                 return (nil, true)
             }
-            guard !state.refreshUncertain else { throw OperationError(code: "invalid_token", status: 401) }
+            guard !state.refreshUncertain else { throw ClientError(code: "invalid_token", status: 401) }
             return (try state.session?.restore(generation: state.generation, authGeneration: state.authGeneration), false)
         }
     }
@@ -456,8 +456,8 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 try state.prune(now: Int64(Date().timeIntervalSince1970))
                 return (.settled(try snapshotValue(state)), true)
             }
-        } catch let error as OperationError
-            where error.code == "device_storage_unavailable" || error.code == "device_storage_full" {
+        } catch let error as ClientError
+            where error.reason == "device_storage_unavailable" || error.reason == "device_storage_full" {
             let blocked = !pending.installsSession || recoveryBlocked(observed.state)
                 || (observed.state.refreshUncertain && !pending.ownsRefresh)
             return .memory(observed, blocked: blocked, recovery: pending)
@@ -465,7 +465,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     }
 
     public func save(_ session: SessionRecord) async throws {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         try transaction { state in
             if state.session?.sessionID != session.sessionID { try state.advanceAuthentication() }
             try state.advance()
@@ -479,7 +479,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     }
 
     public func replace(_ session: SessionRecord, ifMatching expected: SessionRecord) async throws -> Bool {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         let replaced = try transaction { state in
             guard try matches(state, expected) else { return (false, false) }
             if state.session?.sessionID != session.sessionID { try state.advanceAuthentication() }
@@ -508,7 +508,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             }
             if removed { await coordinator.discardVolatileSession() }
             return removed
-        } catch let error as OperationError {
+        } catch let error as ClientError {
             context.block(error)
             await coordinator.discardVolatileSession()
             throw error
@@ -542,7 +542,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
 
     public func install(_ session: SessionRecord, consumingEmail: String?, ifGeneration: UInt64,
                         authGeneration: UInt64? = nil) async throws -> Bool {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         let installed = try transaction { state in
             guard state.generation == ifGeneration else { return (false, false) }
             if let authGeneration {
@@ -579,7 +579,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             }
             if removed { await coordinator.discardVolatileSession() }
             return removed
-        } catch let error as OperationError {
+        } catch let error as ClientError {
             context.block(error)
             await coordinator.discardVolatileSession()
             throw error
@@ -662,7 +662,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
                 try prepareNewIdentity(identity, files: files)
             }
             guard boundInstallation == nil || boundInstallation == identity.installation else {
-                throw OperationError(code: "invalid_token", status: nil)
+                throw ClientError(code: "session_changed", status: nil)
             }
             boundInstallation = identity.installation
             let bytes = try read(identity: identity, files: files)
@@ -703,7 +703,7 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
             }
             _ = try state.encoded()
             return state
-        } catch let error as OperationError where DeviceLimits.errorCodes.contains(error.code) { throw error }
+        } catch let error as ClientError where DeviceLimits.errorCodes.contains(error.reason) { throw error }
         catch { throw deviceError("device_storage_corrupt") }
     }
 

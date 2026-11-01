@@ -155,7 +155,7 @@ struct DeviceKeychain {
         guard status == errSecSuccess else { throw failure(status) }
     }
 
-    private func failure(_ status: OSStatus) -> OperationError {
+    private func failure(_ status: OSStatus) -> ClientError {
         deviceError(status == errSecItemNotFound || status == errSecDecode
                     ? "device_storage_corrupt" : "device_storage_unavailable")
     }

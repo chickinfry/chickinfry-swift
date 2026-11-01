@@ -8,9 +8,9 @@ struct CallDeadline: Sendable {
     }
 
     func remaining() throws -> TimeInterval {
-        guard !Task.isCancelled else { throw OperationError(code: "cancelled", status: nil) }
+        guard !Task.isCancelled else { throw ClientError(code: "cancelled", status: nil) }
         let now = DispatchTime.now().uptimeNanoseconds
-        guard now < end else { throw OperationError(code: "timeout", status: nil) }
+        guard now < end else { throw ClientError(code: "timeout", status: nil) }
         return Double(end - now) / 1_000_000_000
     }
 
@@ -22,7 +22,7 @@ struct CallDeadline: Sendable {
                 waiter.start(timeout: timeout, continuation: continuation, operation: operation)
             }
         } onCancel: {
-            waiter.finish(.failure(OperationError(code: "cancelled", status: nil)))
+            waiter.finish(.failure(ClientError(code: "cancelled", status: nil)))
         }
     }
 }
@@ -57,11 +57,11 @@ private final class DeadlineWait<Value: Sendable>: @unchecked Sendable {
             timer = Task.detached {
                 do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }
                 catch { return }
-                self.finish(.failure(OperationError(code: "timeout", status: nil)))
+                self.finish(.failure(ClientError(code: "timeout", status: nil)))
             }
             return false
         }
-        if cancelled { continuation.resume(throwing: OperationError(code: "cancelled", status: nil)) }
+        if cancelled { continuation.resume(throwing: ClientError(code: "cancelled", status: nil)) }
     }
 
     func finish(_ result: Result<Value, any Error>) {

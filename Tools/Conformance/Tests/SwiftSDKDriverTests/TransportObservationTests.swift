@@ -12,8 +12,8 @@ func actualTransportSnapshotsKeepWatermarksAndCompletionSeparate(withStore: Bool
     let peer = try TestPeer(body: body, chunkSize: 1024)
     let origin = try await peer.start()
     defer { peer.stop() }
-    let base = try ClientTransport(origin: origin)
-    let transport = try (withStore ? base.withSession(MemorySessionStore(origin: origin)) : base)
+    let base = try HTTPTransport(origin: origin)
+    let transport = try (withStore ? base.withSession(MemoryStore(origin: origin)) : base)
     let context = Conformance.Call(event: { event in
         if event.phase == "read" {
             #expect(event.readBytes > event.retainedBytes)
@@ -65,12 +65,12 @@ func actualTransportSnapshotsKeepWatermarksAndCompletionSeparate(withStore: Bool
     let context = Conformance.Call(event: { observation.record("c:overflow", event: $0) },
                                    barrier: { _, _ in }, clear: { _, _ in })
     do {
-        let transport = try ClientTransport(origin: origin)
+        let transport = try HTTPTransport(origin: origin)
         _ = try await Conformance.$call.withValue(context) {
             try await PlainBridge(transport).call("probe.echo", input: .object(["wire_value": .string("test")]))
         }
         Issue.record("An oversized response must fail")
-    } catch let error as OperationError { #expect(error.code == "response_too_large") }
+    } catch let error as ClientError { #expect(error.code == "resource_exhausted") }
     let deadline = ContinuousClock.now + .seconds(2)
     var events: [JSON] = []
     repeat {
@@ -145,13 +145,13 @@ func actualTransportSnapshotsKeepWatermarksAndCompletionSeparate(withStore: Bool
     let peer = try TestPeer(responses: [], chunkSize: 1)
     let origin = try await peer.start()
     defer { peer.stop() }
-    let transport = try ClientTransport(origin: origin, timeout: 1)
+    let transport = try HTTPTransport(origin: origin, timeout: 1)
     do {
         _ = try await Conformance.$call.withValue(context) {
             try await PlainBridge(transport).call("probe.echo", input: .object(["wire_value": .string("test")]))
         }
         Issue.record("A failed connection must fail")
-    } catch let error as OperationError { #expect(error.code == "transport_error") }
+    } catch let error as ClientError { #expect(error.code == "unavailable") }
     let events = try #require(observation.snapshot("c:failed", after: 0)["events"].array)
     #expect(!events.contains { $0["phase"] == .string("cancel-requested") || $0["phase"] == .string("cancel-observed") })
     #expect(events.contains { $0["phase"] == .string("reader-closed") })

@@ -434,7 +434,7 @@ private func randomSessionToken() -> String {
     ]), "error": .null]))
     let result = try await messages.wait { $0["id"] == .string("c:call") }
     #expect(result["error"]["kind"] == .string("sdk"))
-    #expect(result["error"]["code"] == .string("timeout"))
+    #expect(result["error"]["code"] == .string("deadline_exceeded"))
     #expect(result["error"]["outcomeUnknown"] == .bool(false))
     #expect(peer.connectionCount == 0)
     await driver.shutdown()

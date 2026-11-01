@@ -5,13 +5,13 @@ let driverVersion = "1.0.0"
 let capabilities = ["client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace", "client.transport"]
 
 private struct ClientEntry: Sendable {
-    let transport: ClientTransport
+    let transport: HTTPTransport
     let fixture: String
     let store: ObservedStore?
     let plain: PlainBridge?
     let auth: AuthBridge?
 
-    init(transport: ClientTransport, fixture: String, store: ObservedStore?) {
+    init(transport: HTTPTransport, fixture: String, store: ObservedStore?) {
         self.transport = transport
         self.fixture = fixture
         self.store = store
@@ -120,6 +120,17 @@ actor Driver {
                     return try await group.next()!
                 }
                 try self.reply(id, result: result)
+            } catch let error as ClientError {
+                let descriptions = [error.description, error.localizedDescription, String(reflecting: error), error.code]
+                let rawDetails = self.secretValues.values.contains { value in
+                    !value.isEmpty && descriptions.contains { $0.contains(value) }
+                }
+                try? self.reply(id, error: .object([
+                    "kind": .string("sdk"), "code": self.redact(.string(error.code)), "httpStatus": .optional(error.status),
+                    "outcomeUnknown": self.callUnknown[id].map(JSON.bool) ?? .bool(false),
+                    "rawTransportDetails": .bool(rawDetails),
+                    "constructorNetworkRequests": command == "client.create" ? .optional(self.constructorCounts[id]) : .null,
+                ].filter { $0.key != "constructorNetworkRequests" || command == "client.create" }))
             } catch let error as OperationError {
                 let descriptions = [error.description, error.localizedDescription, String(reflecting: error), error.code]
                 let rawDetails = self.secretValues.values.contains { value in
@@ -171,7 +182,7 @@ actor Driver {
                       let timeout = args["requestTimeoutMs"].integer, timeout > 0 else { throw ProtocolFailure.invalidArgs }
                 let fixture = try args.text("fixture")
                 guard ["plain", "auth"].contains(fixture) else { throw ProtocolFailure.invalidArgs }
-                var transport = try ClientTransport(origin: args.text("origin"), timeout: Double(timeout) / 1000)
+                var transport = try HTTPTransport(origin: args.text("origin"), timeout: Double(timeout) / 1000)
                 var store: ObservedStore?
                 if args.object?["storeRef"] != nil {
                     store = stores[try ref("storeRef")]

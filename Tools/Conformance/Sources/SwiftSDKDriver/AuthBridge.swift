@@ -3,7 +3,7 @@ import ChickinfryClientAuth
 
 struct AuthBridge: Sendable {
     let client: ChickinfryClientAuth.Client
-    init(_ transport: ClientTransport) { client = .init(transport) }
+    init(_ transport: HTTPTransport) { client = ChickinfryClientAuth.createClient(transport: transport) }
 
     func call(_ operation: String, input: JSON) async throws -> [String: JSON] {
         switch operation {
@@ -28,10 +28,6 @@ struct AuthBridge: Sendable {
                            result.refreshExpiresAt, result.userId, result.sessionId)
         case "auth.refresh":
             let result = try await client.auth.refresh(.init(refreshToken: input.text("refresh_token")))
-            return session(result.accessToken, result.refreshToken, result.expiresAt,
-                           result.refreshExpiresAt, result.userId, result.sessionId)
-        case "auth.identity":
-            let result = try await client.auth.identity(.init(credential: input.text("credential"), provider: input.text("provider")))
             return session(result.accessToken, result.refreshToken, result.expiresAt,
                            result.refreshExpiresAt, result.userId, result.sessionId)
         case "auth.logout":

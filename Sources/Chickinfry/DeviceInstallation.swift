@@ -19,7 +19,7 @@ struct DeviceInstallation {
     func prepare() throws -> String {
         do { return try complete() }
         catch {
-            var failure = (error as? OperationError) ?? deviceError()
+            var failure = (error as? ClientError) ?? deviceError()
             failure.devicePreparation = true
             throw failure
         }
@@ -62,7 +62,7 @@ struct DeviceInstallation {
             guard parts.count == 4, UUID(uuidString: parts[0]) != nil, owner.scope.app == app,
                   validDeviceComponent(owner.scope.project), validDeviceComponent(owner.scope.environment),
                   owner.scope.project == parts[1], owner.scope.environment == parts[2], owner.scope.origin == parts[3],
-                  (try? ClientTransport.validateOrigin(owner.scope.origin)) == owner.scope.origin,
+                  (try? HTTPTransport.validateOrigin(owner.scope.origin)) == owner.scope.origin,
                   owner.installation == nil || owner.installation == parts[0] else {
                 throw deviceError("device_storage_corrupt")
             }
@@ -76,7 +76,7 @@ struct DeviceInstallation {
         return marker.installation
     }
 
-    private func keychainError(_ status: Int32) -> OperationError {
+    private func keychainError(_ status: Int32) -> ClientError {
         deviceError(status == errSecDecode ? "device_storage_corrupt" : "device_storage_unavailable")
     }
 }

@@ -1,7 +1,7 @@
 import Foundation
 
 /// In-process session storage. Persistence and cross-process coordination belong to the app.
-public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+public actor MemoryStore: SessionStore, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     /// The one origin this store holds records for.
     public nonisolated let origin: String
     /// The single coordinator shared by every access to this store.
@@ -17,7 +17,7 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
 
     /// Creates empty in-process storage, or throws if the origin is invalid.
     public init(origin: String) throws {
-        self.origin = try ClientTransport.validateOrigin(origin)
+        self.origin = try HTTPTransport.validateOrigin(origin)
     }
 
     /// Returns the stored record, or nil when none is present.
@@ -25,7 +25,7 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
 
     /// Makes the record available before returning; an origin mismatch throws.
     public func save(_ session: SessionRecord) async throws {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         self.session = session
         #if CHICKINFRY_CONFORMANCE
         conformanceRevision += 1
@@ -34,7 +34,7 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
 
     /// Returns true after replacement or false on a credential mismatch or absence; an origin mismatch throws.
     public func replace(_ session: SessionRecord, ifMatching expected: SessionRecord) async throws -> Bool {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         guard self.session?.credential == expected.credential else { return false }
         self.session = session
         #if CHICKINFRY_CONFORMANCE
@@ -53,7 +53,7 @@ public actor MemorySessionStore: SessionStore, CustomStringConvertible, CustomDe
         return true
     }
 
-    public nonisolated var description: String { "MemorySessionStore" }
+    public nonisolated var description: String { "MemoryStore" }
     public nonisolated var debugDescription: String { description }
     public nonisolated var customMirror: Mirror {
         Mirror(self, children: EmptyCollection<Mirror.Child>(), displayStyle: .class)

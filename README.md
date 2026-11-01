@@ -26,7 +26,7 @@ import Chickinfry
 struct ReadInput: Encodable, Sendable { let id: String }
 struct ReadOutput: Decodable, Sendable { let title: String }
 
-let transport = try ClientTransport(origin: "https://api.example.com")
+let transport = try HTTPTransport(origin: "https://api.example.com")
 let result: ReadOutput = try await transport.invoke(
     "notes.read", input: ReadInput(id: "note-id")
 )

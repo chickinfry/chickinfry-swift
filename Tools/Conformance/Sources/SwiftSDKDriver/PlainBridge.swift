@@ -3,7 +3,7 @@ import ChickinfryClientPlain
 
 struct PlainBridge: Sendable {
     let client: ChickinfryClientPlain.Client
-    init(_ transport: ClientTransport) { client = .init(transport) }
+    init(_ transport: HTTPTransport) { client = ChickinfryClientPlain.createClient(transport: transport) }
 
     func call(_ operation: String, input: JSON) async throws -> [String: JSON] {
         switch operation {

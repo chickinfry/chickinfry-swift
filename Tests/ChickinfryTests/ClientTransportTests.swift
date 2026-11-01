@@ -20,17 +20,21 @@ func withPeer(_ responses: [PeerResponse] = [],
 
 @discardableResult
 func expectFailure(_ code: String, status: Int?,
-                           body: @Sendable () async throws -> Void) async -> OperationError? {
+                           body: @Sendable () async throws -> Void) async -> ClientError? {
     do {
         try await body()
         Issue.record("Expected an operation failure")
         return nil
-    } catch let error as OperationError {
+    } catch let error as ClientError {
         #expect(error.code == code)
         #expect(error.status == status)
         return error
+    } catch let error as OperationError {
+        #expect(error.code == code)
+        #expect(error.status == status)
+        return nil
     } catch {
-        Issue.record("Expected a safe OperationError, received \(type(of: error))")
+        Issue.record("Expected a safe ClientError, received \(type(of: error))")
         return nil
     }
 }
@@ -41,7 +45,7 @@ func expectFailure(_ code: String, status: Int?,
     let value = "2026-10-14T01:02:03.123456789Z / 한글 \"value\""
     let data = try JSONEncoder().encode(Payload(value: value))
     try await withPeer(Array(repeating: .reply(200, data), count: 3)) { server in
-        let original = try ClientTransport(origin: server.origin + "/")
+        let original = try HTTPTransport(origin: server.origin + "/")
         let authenticated = try original.withBearer(token)
         let other = try authenticated.withBearer(otherToken)
         async let first: Payload = original.invoke("notes.create_note", input: Payload(value: value))
@@ -61,14 +65,14 @@ func expectFailure(_ code: String, status: Int?,
             #expect(try JSONDecoder().decode(Payload.self, from: request.body).value == value)
         }
         for malformed in ["", "short", token + "\r\nInjected: secret", String(repeating: "/", count: 43)] {
-            #expect(throws: OperationError.self) { try original.withBearer(malformed) }
+            #expect(throws: ClientError.self) { try original.withBearer(malformed) }
         }
     }
 }
 
 @Test func transportFormattingDoesNotExposeCredentials() throws {
     let token = String((UUID().uuidString + UUID().uuidString).filter { $0 != "-" }.prefix(43))
-    let transport = try ClientTransport(origin: "https://example.com").withBearer(token)
+    let transport = try HTTPTransport(origin: "https://example.com").withBearer(token)
     var printed = ""
     print(transport, to: &printed)
     var dumped = ""
@@ -84,7 +88,7 @@ func expectFailure(_ code: String, status: Int?,
 @Test func rawOriginsAreRejectedBeforeNetwork() async throws {
     for accepted in ["https://example.com", "https://example.com:443/", "http://127.0.0.1",
                      "http://127.255.0.254:8080/", "http://[::1]", "http://[::1]:8080/"] {
-        #expect(throws: Never.self) { try ClientTransport(origin: accepted) }
+        #expect(throws: Never.self) { try HTTPTransport(origin: accepted) }
     }
     try await withPeer([.reply(200, validBody)]) { server in
         let rejected = [
@@ -100,20 +104,20 @@ func expectFailure(_ code: String, status: Int?,
             "", "https:///", "https://example.com\n",
         ]
         for origin in rejected {
-            await expectFailure("invalid_origin", status: nil) {
-                let transport = try ClientTransport(origin: origin)
+            await expectFailure("invalid_argument", status: nil) {
+                let transport = try HTTPTransport(origin: origin)
                 let _: Payload = try await transport.invoke("notes.read", input: Empty())
             }
         }
         #expect(await server.log.requests.count == 0)
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         for operation in ["notes.read\n", "notes/read", "../notes.read", "notes.read?query"] {
-            await expectFailure("invalid_input", status: nil) {
+            await expectFailure("invalid_argument", status: nil) {
                 let _: Payload = try await transport.invoke(operation, input: Empty())
             }
         }
         for timeout in [0, -1, .infinity, .nan] as [TimeInterval] {
-            #expect(throws: OperationError.self) { try ClientTransport(origin: server.origin, timeout: timeout) }
+            #expect(throws: ClientError.self) { try HTTPTransport(origin: server.origin, timeout: timeout) }
         }
         #expect(await server.log.requests.count == 0)
         let _: Payload = try await transport.invoke("notes.read", input: Empty())
@@ -126,13 +130,13 @@ func expectFailure(_ code: String, status: Int?,
     let boundary = Payload(value: String(repeating: "x", count: 4 * 1024 * 1024 - overhead))
     #expect(try JSONEncoder().encode(boundary).count == 4 * 1024 * 1024)
     try await withPeer([.reply(200, validBody)]) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         let _: Payload = try await transport.invoke("notes.write", input: boundary)
         await server.log.waitForCompletions(1)
         #expect(await server.log.requests.first?.body.count == 4 * 1024 * 1024)
         for oversized in [Payload(value: boundary.value + "x"),
                           Payload(value: String(repeating: "é", count: 2 * 1024 * 1024))] {
-            await expectFailure("request_too_large", status: nil) {
+            await expectFailure("resource_exhausted", status: nil) {
                 let _: Payload = try await transport.invoke("notes.write", input: oversized)
             }
         }
@@ -148,13 +152,13 @@ func expectFailure(_ code: String, status: Int?,
     let overBoundary = try JSONEncoder().encode(Payload(value: payload.value + "x"))
     #expect(overBoundary.count == 1024 * 1024 + 1)
     try await withPeer([.reply(200, data), .reply(200, overBoundary), .stream(8 * 1024 * 1024)]) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         let output: Payload = try await transport.invoke("notes.read", input: Empty())
         #expect(output.value == payload.value)
-        await expectFailure("response_too_large", status: 200) {
+        await expectFailure("resource_exhausted", status: 200) {
             let _: Payload = try await transport.invoke("notes.read", input: Empty())
         }
-        await expectFailure("response_too_large", status: 200) {
+        await expectFailure("resource_exhausted", status: 200) {
             let _: Payload = try await transport.invoke("notes.read", input: Empty())
         }
         await server.log.waitForCompletions(3)
@@ -172,9 +176,9 @@ func expectFailure(_ code: String, status: Int?,
             PeerResponse.reply($0, Data("{\"error\":\"moved\"}".utf8), ["Location": destination.origin + "/notes.read"])
         }
         try await withPeer(responses) { source in
-            let transport = try ClientTransport(origin: source.origin).withBearer(String(repeating: "a", count: 43))
+            let transport = try HTTPTransport(origin: source.origin).withBearer(String(repeating: "a", count: 43))
             for status in statuses {
-                await expectFailure("invalid_response", status: status) {
+                await expectFailure("internal", status: status) {
                     let _: Payload = try await transport.invoke("notes.read", input: Empty())
                 }
             }
@@ -188,19 +192,19 @@ func expectFailure(_ code: String, status: Int?,
 @Test(arguments: [false, true]) func deadlineCancelsSilentAndTricklingPeers(headers: Bool) async throws {
     let reply = PeerGate()
     try await withPeer([.stall(headers), .gatedReply(200, validBody, reply)]) { server in
-        let transport = try ClientTransport(origin: server.origin, timeout: 1)
+        let transport = try HTTPTransport(origin: server.origin, timeout: 1)
         let start = ContinuousClock.now
         let stalled = Task {
             try await transport.invoke("notes.read", input: Empty(), as: Payload.self)
         }
         await server.log.waitForRequests(1)
-        await expectFailure("timeout", status: headers ? 200 : nil) { _ = try await stalled.value }
+        await expectFailure("deadline_exceeded", status: headers ? 200 : nil) { _ = try await stalled.value }
         #expect(start.duration(to: .now) < .seconds(5))
         await server.log.waitForCompletions(1)
         #expect(await server.log.completions.first?.disconnected == true)
         #expect(await server.log.requests.count == 1)
         // The recovery request must not inherit the deliberately short timeout of the stalled request.
-        let recovery = try ClientTransport(origin: server.origin)
+        let recovery = try HTTPTransport(origin: server.origin)
         let next = Task { try await recovery.invoke("notes.read", input: Empty(), as: Payload.self) }
         await server.log.waitForRequests(2)
         await reply.open()
@@ -215,9 +219,9 @@ func expectFailure(_ code: String, status: Int?,
     let responses = invalid.map { PeerResponse.reply(503, Data($0.utf8)) }
         + [.reply(409, Data("{\"error\":\"future_error_code\"}".utf8))]
     try await withPeer(responses) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         for _ in invalid {
-            let error = await expectFailure("invalid_response", status: 503) {
+            let error = await expectFailure("internal", status: 503) {
                 let _: Payload = try await transport.invoke("notes.read", input: Empty())
             }
             #expect(error?.description.contains("secret") == false)
@@ -256,27 +260,27 @@ func expectFailure(_ code: String, status: Int?,
         + [.reply(200, utf8BOM + validBody),
            .reply(409, utf8BOM + Data("{\"error\":\"denied\"}".utf8))]
     try await withPeer(responses) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         for _ in damaged {
-            await expectFailure("invalid_response", status: 200) {
+            await expectFailure("internal", status: 200) {
                 let _: Payload = try await transport.invoke("notes.read", input: Empty())
             }
         }
-        await expectFailure("invalid_response", status: 200) {
+        await expectFailure("internal", status: 200) {
             let _: Empty = try await transport.invoke("notes.read", input: Empty())
         }
-        await expectFailure("invalid_response", status: 204) {
+        await expectFailure("internal", status: 204) {
             let _: Empty = try await transport.invoke("notes.read", input: Empty())
         }
         for (status, _) in encodedResponses {
-            await expectFailure("invalid_response", status: status) {
+            await expectFailure("internal", status: status) {
                 let _: Payload = try await transport.invoke("notes.read", input: Empty())
             }
         }
         let unicode: Payload = try await transport.invoke("notes.read", input: Empty())
         #expect(unicode.value == "\u{0}한글")
         for (status, _) in invalidUTF8Responses {
-            await expectFailure("invalid_response", status: status) {
+            await expectFailure("internal", status: status) {
                 let _: Payload = try await transport.invoke("notes.read", input: Empty())
             }
         }
@@ -285,7 +289,7 @@ func expectFailure(_ code: String, status: Int?,
         await expectFailure("denied", status: 409) {
             let _: Payload = try await transport.invoke("notes.read", input: Empty())
         }
-        await expectFailure("invalid_input", status: nil) {
+        await expectFailure("invalid_argument", status: nil) {
             let _: Payload = try await transport.invoke("notes.read", input: ["array"])
         }
         #expect(await server.log.requests.count == responses.count)
@@ -294,9 +298,9 @@ func expectFailure(_ code: String, status: Int?,
 
 @Test func connectionLossPreservesOnlyObservedStatusWithoutRetry() async throws {
     try await withPeer([.disconnect, .truncated]) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         for status in [nil, 200] as [Int?] {
-            let error = await expectFailure("transport_error", status: status) {
+            let error = await expectFailure("unavailable", status: status) {
                 let _: Payload = try await transport.invoke("notes.write", input: Empty())
             }
             #expect(error?.description.contains(server.origin) == false)
@@ -308,20 +312,20 @@ func expectFailure(_ code: String, status: Int?,
 
 @Test func callerCancellationClosesTheActualRequest() async throws {
     try await withPeer([.stall(false)]) { server in
-        let transport = try ClientTransport(origin: server.origin)
+        let transport = try HTTPTransport(origin: server.origin)
         let call = Task { () throws -> Payload in
             try await transport.invoke("notes.write", input: Empty())
         }
         await server.log.waitForRequests(1)
         call.cancel()
-        await expectFailure("cancelled", status: nil) { _ = try await call.value }
+        await expectFailure("canceled", status: nil) { _ = try await call.value }
         await server.log.waitForCompletions(1)
         #expect(await server.log.completions.first?.disconnected == true)
         let cancelled = Task { () throws -> Payload in
             withUnsafeCurrentTask { $0?.cancel() }
             return try await transport.invoke("notes.write", input: Empty())
         }
-        await expectFailure("cancelled", status: nil) { _ = try await cancelled.value }
+        await expectFailure("canceled", status: nil) { _ = try await cancelled.value }
         #expect(await server.log.requests.count == 1)
     }
 }

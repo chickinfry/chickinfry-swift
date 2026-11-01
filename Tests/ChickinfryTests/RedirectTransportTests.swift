@@ -9,20 +9,20 @@ import Testing
             for size in [8, 64] {
                 for attempt in 0..<3 {
                     let peer = try LoopbackServer([.redirectStream(status, chunked, size * 1024 * 1024)])
-                    let transport = try ClientTransport(origin: peer.origin, timeout: 3)
+                    let transport = try HTTPTransport(origin: peer.origin, timeout: 3)
                     let start = ContinuousClock.now
-                    var failure: OperationError?
+                    var failure: ClientError?
                     do {
                         let _: Empty = try await transport.invoke("probe.echo", input: Empty())
                         Issue.record("A redirect must fail")
-                    } catch let error as OperationError { failure = error }
+                    } catch let error as ClientError { failure = error }
                     let elapsed = start.duration(to: .now)
                     await peer.log.waitForCompletions(1)
                     let completion = try #require(await peer.log.completions.first)
                     await peer.stop()
                     print("REDIRECT status=\(status) chunked=\(chunked) mib=\(size) attempt=\(attempt) sent=\(completion.sent) elapsed=\(elapsed) closed=\(completion.disconnected)")
                     #expect(failure?.status == status)
-                    #expect(failure?.code == "invalid_response")
+                    #expect(failure?.code == "internal")
                     // A stalled redirect reaches the three-second deadline; one second leaves hundreds of scheduling turns.
                     try #require(elapsed < .seconds(1))
                     #expect(completion.disconnected)

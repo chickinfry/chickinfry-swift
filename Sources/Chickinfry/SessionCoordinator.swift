@@ -130,7 +130,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                 if try await store.discardAttempt(attempt, ifGeneration: snapshot.generation) { return }
             }
         } catch {
-            var failure = (error as? OperationError) ?? deviceError()
+            var failure = (error as? ClientError) ?? deviceError()
             failure.devicePreparation = true
             throw failure
         }
@@ -151,7 +151,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                 do {
                     let snapshot = try await device.snapshot()
                     if !usesVolatileSession {
-                        guard !snapshot.state.refreshUncertain else { throw OperationError(code: "invalid_token", status: 401) }
+                        guard !snapshot.state.refreshUncertain else { throw ClientError(code: "invalid_token", status: 401) }
                         return snapshot.session
                     }
                     if let generation = volatileLocalAuthGeneration, snapshot.localAuthGeneration > generation {
@@ -159,7 +159,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                         return nil
                     }
                     return snapshot.session
-                } catch let error as OperationError where error.code == "device_storage_unavailable" {
+                } catch let error as ClientError where error.reason == "device_storage_unavailable" {
                     // E1 remains usable when storage cannot report a newer authentication boundary.
                 }
             }
@@ -213,8 +213,8 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                 memoryGeneration = generation
                 memoryLocalGeneration = local
             }
-        } catch let error as OperationError
-            where !error.devicePreparation && (error.code == "device_storage_unavailable" || error.code == "device_storage_full") {
+        } catch let error as ClientError
+            where !error.devicePreparation && (error.reason == "device_storage_unavailable" || error.reason == "device_storage_full") {
             _ = error
         } catch {
             discardVolatileSession()
@@ -257,7 +257,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         for (key, flight) in flights {
             uncertain.insert(key)
             for waiter in flight.waiters.values {
-                waiter.resume(throwing: OperationError(code: "cancelled", status: nil))
+                waiter.resume(throwing: ClientError(code: "cancelled", status: nil))
             }
         }
         flights = [:]
@@ -290,7 +290,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                  perform: @escaping @Sendable () async throws -> SessionRecord) async throws -> SessionRecord? {
         let key = expected.credential
         let waiter = UUID()
-        guard !Task.isCancelled else { throw OperationError(code: "cancelled", status: nil) }
+        guard !Task.isCancelled else { throw ClientError(code: "cancelled", status: nil) }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 if flights[key] != nil {
@@ -319,7 +319,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                             result = .success(current)
                         } else {
                             guard !self.uncertain.contains(key) else {
-                                throw OperationError(code: "invalid_token", status: 401)
+                                throw ClientError(code: "invalid_token", status: 401)
                             }
                             let before = !self.usesVolatileSession
                                 ? try await (store as? any DeviceAuthenticationStore)?.snapshot() : nil
@@ -329,7 +329,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                                 let claimed = try await sessionStoreCall {
                                     try await device.beginRefresh(ifMatching: expected, requestID: requestID)
                                 }
-                                guard claimed else { throw OperationError(code: "invalid_token", status: 401) }
+                                guard claimed else { throw ClientError(code: "invalid_token", status: 401) }
                                 ownedExpected.deviceRefreshRequestID = requestID
                             }
                             let refreshed: SessionRecord
@@ -464,7 +464,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         _ = await conformanceHooks[waiter]?.result
         conformanceHooks[waiter] = nil
         #endif
-        continuation.resume(throwing: OperationError(code: "cancelled", status: nil))
+        continuation.resume(throwing: ClientError(code: "cancelled", status: nil))
     }
 
     public nonisolated var description: String { "SessionCoordinator" }

@@ -17,8 +17,8 @@ enum DeviceLimits {
                                          "device_storage_full", "device_storage_version_unsupported"]
 }
 
-func deviceError(_ code: String = "device_storage_unavailable") -> OperationError {
-    OperationError(code: code, status: nil)
+func deviceError(_ code: String = "device_storage_unavailable") -> ClientError {
+    ClientError(code: code, status: nil)
 }
 
 /// All paths below the opened directory are relative to a verified directory descriptor.
@@ -65,7 +65,7 @@ final class DeviceFiles: Sendable {
                 try location.setResourceValues(values)
             }
             #endif
-        } catch let error as OperationError { close(current); throw error }
+        } catch let error as ClientError { close(current); throw error }
         catch { close(current); throw deviceError() }
     }
 
@@ -177,7 +177,7 @@ final class DeviceFiles: Sendable {
               info.st_mode & 0o777 == 0o600, info.st_nlink == 1 else { throw deviceError() }
     }
 
-    private static func failure() -> OperationError {
+    private static func failure() -> ClientError {
         deviceError(errno == ENOSPC || errno == EDQUOT ? "device_storage_full" : "device_storage_unavailable")
     }
 }

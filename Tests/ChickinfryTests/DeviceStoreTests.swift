@@ -144,7 +144,7 @@ final class DeviceProcessProbe: XCTestCase, @unchecked Sendable {
                 do {
                     _ = try await store.load()
                     throw DeviceProbeFailure.check
-                } catch let error as OperationError { try probeCheck(error.code == "invalid_token") }
+                } catch let error as ClientError { try probeCheck(error.code == "unauthenticated") }
             case "recover":
                 try probeCheck(try await store.install(deviceRecord(), consumingEmail: nil,
                                                 ifGeneration: store.snapshot().generation))
@@ -249,7 +249,7 @@ private func deviceStore(_ root: URL, _ app: String, project: String = "project"
 
 private func deviceFailure(_ code: String, _ body: () async throws -> Void) async {
     do { try await body(); Issue.record("Expected device storage failure") }
-    catch let error as OperationError { #expect(error.code == code) }
+    catch let error as ClientError { #expect(error.code == code) }
     catch { Issue.record("Unexpected error type") }
 }
 
@@ -359,7 +359,7 @@ func deviceConfirmationRetriesPreserveTheAuthBoundary(kind: String) async throws
         }
         let racing = RacingConfirmationStore(backing)
         let store: any SessionStore = kind == "bound" ? racing : backing
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         let session = try deviceRecord()
         let result = try await transport.acceptSession(session, after: before, consuming: attempt)
         let serverResultPreserved = result.sessionID == session.sessionID
@@ -402,7 +402,7 @@ func deviceVolatileSessionObservesExternalAuthenticationChange(mode: String) asy
                                                  persist: .dir(root.path), keychainCalls: nil, protected: false)
             let racing = RacingConfirmationStore(backing)
             let before = try await backing.snapshot()
-            let transport = try ClientTransport(origin: server.origin).withSession(racing)
+            let transport = try HTTPTransport(origin: server.origin).withSession(racing)
             _ = try await transport.acceptSession(deviceRecord(origin: server.origin), after: before)
             try FileManager.default.setAttributes([.posixPermissions: 0o722], ofItemAtPath: root.path)
             let activeBeforeChange = try await loadSession(racing, origin: server.origin) != nil
@@ -464,7 +464,7 @@ func deviceRefreshPreservesAnotherScreensAttempt(races: Int, newSession: Bool) a
             let persisted = try await store.load()?.credential == replacement.credential
             #expect(persisted)
         } else {
-            await deviceFailure("invalid_token") { _ = try await store.load() }
+            await deviceFailure("unauthenticated") { _ = try await store.load() }
             let retained = try await loadSession(racing, origin: deviceOrigin)?.credential == replacement.credential
             #expect(retained)
         }
@@ -513,7 +513,7 @@ func deviceRefreshNeverOverwritesAnAuthenticationChange(newLogin: Bool) async th
                                         acceptedAt: accepted, expiresAt: expires, ifGeneration: snapshot.generation)
         let beforeSecond = try await store.snapshot()
         let second = try #require(beforeSecond.attempts.first { $0.screen == "second" })
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         let installed = try deviceRecord()
         _ = try await transport.acceptSession(installed, after: beforeFirst, consuming: first)
         let late = try deviceRecord()
@@ -552,7 +552,7 @@ func deviceAccountSwitchProtectsEachSideEffectBoundary(outcome: String) async th
         if outcome != "first" { try await store.save(previous) }
         if outcome == "preflight-failure" { calls.updateFailure = errSecInteractionNotAllowed }
         if outcome == "preflight-failure" {
-            await deviceFailure("device_storage_unavailable") { _ = try await store.snapshot(preparingAuthentication: true) }
+            await deviceFailure("failed_precondition") { _ = try await store.snapshot(preparingAuthentication: true) }
             calls.updateFailure = nil
             let previousPreserved = try await store.load()?.sessionID == previous.sessionID
             #expect(previousPreserved)
@@ -560,7 +560,7 @@ func deviceAccountSwitchProtectsEachSideEffectBoundary(outcome: String) async th
         }
         let before = try await store.snapshot(preparingAuthentication: true)
         #expect((before.authenticationSwitchID == nil) == (outcome == "first"))
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         if outcome == "failure" {
             try await transport.rejectAuthentication(before)
             let previousPreserved = try await store.load()?.sessionID == previous.sessionID
@@ -593,7 +593,7 @@ func deviceEmailConfirmationNeedsNoSignupReference(afterLogout: Bool) async thro
                                         acceptedAt: accepted, expiresAt: expires, ifGeneration: initial.generation)
         let before = try await store.snapshot()
         if afterLogout { _ = try await store.logout(ifGeneration: before.generation) }
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         let response = try deviceRecord()
         let output = try await transport.acceptSession(response, after: before, confirmedEmail: "confirmed@example.test")
         let resultPreserved = output.sessionID == response.sessionID
@@ -603,14 +603,14 @@ func deviceEmailConfirmationNeedsNoSignupReference(afterLogout: Bool) async thro
     }
 }
 
-@Test(arguments: ["device_storage_unavailable", "device_storage_corrupt", "device_storage_full",
-                  "device_storage_version_unsupported"])
-func deviceStorageErrorsKeepTheirCategory(code: String) async {
+@Test(arguments: [("device_storage_unavailable", "failed_precondition"), ("device_storage_corrupt", "data_loss"),
+                  ("device_storage_full", "resource_exhausted"), ("device_storage_version_unsupported", "unimplemented")])
+func deviceStorageErrorsKeepTheirCategory(code: String, expected: String) async {
     do {
-        let _: Bool = try await sessionStoreCall { throw OperationError(code: code, status: nil) }
+        let _: Bool = try await sessionStoreCall { throw ClientError(code: code, status: nil) }
         Issue.record("Expected a device storage failure")
-    } catch let error as OperationError {
-        #expect(error.code == code)
+    } catch let error as ClientError {
+        #expect(error.code == expected)
         #expect(error.status == nil)
     } catch { Issue.record("Unexpected error type") }
 }
@@ -689,7 +689,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
         #expect(try await first.beginRefresh(ifMatching: expected))
         let second = try deviceStore(root, app)
         #expect(try await second.beginRefresh(ifMatching: expected) == false)
-        await deviceFailure("invalid_token") { _ = try await second.load() }
+        await deviceFailure("unauthenticated") { _ = try await second.load() }
         let replacement = try deviceRecord()
         #expect(try await first.replace(replacement, ifMatching: expected))
         let sessionMatches4 = try await second.load()?.sessionID == replacement.sessionID
@@ -698,7 +698,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
 }
 
 @Test func deviceLocationFailureDoesNotBecomeMemoryStorage() async throws {
-    await deviceFailure("device_storage_unavailable") {
+    await deviceFailure("failed_precondition") {
         _ = try DeviceSessionStore(origin: deviceOrigin, app: "unavailable", project: "project",
                                           environment: "test", persist: .dir(""),
                                           keychainCalls: nil, protected: false)
@@ -718,7 +718,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
             #expect(attemptSaved4)
         }
         let generation = try await store.snapshot().generation
-        await deviceFailure("device_storage_full") {
+        await deviceFailure("resource_exhausted") {
             _ = try await store.saveAttempt(id: UUID().uuidString, email: "four@example.test", screen: "four",
                                             acceptedAt: accepted, expiresAt: expires, ifGeneration: generation)
         }
@@ -742,7 +742,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
             }
             Issue.record("Expected interruption")
         }
-        catch is OperationError {}
+        catch is ClientError {}
         let unchanged = try files.read("value") == original
         #expect(unchanged)
         let replacement = Data("replacement".utf8)
@@ -757,7 +757,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
         }
         #expect(synchronized)
         let unconfirmed = Data("unconfirmed replacement".utf8)
-        await deviceFailure("device_storage_unavailable") {
+        await deviceFailure("failed_precondition") {
             try files.locked {
                 try files.write("value", data: unconfirmed, syncDirectory: { directory in
                     #expect(directory == files.descriptor)
@@ -768,7 +768,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
             }
         }
         let oversized = Data(repeating: 0, count: DeviceLimits.bundleBytes + 1)
-        await deviceFailure("device_storage_full") { try files.write("value", data: oversized) }
+        await deviceFailure("resource_exhausted") { try files.write("value", data: oversized) }
     }
 }
 
@@ -788,14 +788,14 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
             do {
                 _ = try deviceStore(root, app)
                 Issue.record("Expected rejection of an unsafe internal directory")
-            } catch let error as OperationError {
-                #expect(error.code == "device_storage_unavailable")
+            } catch let error as ClientError {
+                #expect(error.code == "failed_precondition")
                 #expect(error.description == "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.")
             }
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: root.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path) }
-        await deviceFailure("device_storage_unavailable") { _ = try deviceStore(root, app) }
+        await deviceFailure("failed_precondition") { _ = try deviceStore(root, app) }
     }
 }
 
@@ -822,7 +822,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
                                           expiresAt: old.expiresAt, refreshExpiresAt: old.refreshExpiresAt,
                                           userID: old.userID, sessionID: old.sessionID)
             try await store.save(bound)
-            let transport = try ClientTransport(origin: server.origin).withSession(store)
+            let transport = try HTTPTransport(origin: server.origin).withSession(store)
             let output = try await transport.invoke("account.read", input: Empty(), as: Payload.self)
             #expect(output.value == "ok")
             let reopened = try DeviceSessionStore(origin: server.origin, app: app, project: "project", environment: "test",
@@ -841,7 +841,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
 
 @Test func deviceRejectsUnsafeLocationsAndSymbolicLinks() async throws {
     for path in ["/private/tmp"] {
-        await deviceFailure("device_storage_unavailable") {
+        await deviceFailure("failed_precondition") {
             let store = try DeviceSessionStore(origin: deviceOrigin, app: "unsafe", project: "project",
                                            environment: "test", persist: .dir(path),
                                            keychainCalls: nil, protected: false)
@@ -851,7 +851,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String) async {
     try await withDeviceFixture { root, app in
         let linked = root.appendingPathComponent("linked")
         try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: root)
-        await deviceFailure("device_storage_unavailable") {
+        await deviceFailure("failed_precondition") {
             let store = try deviceStore(linked, app)
             _ = try await store.load()
         }
@@ -913,11 +913,11 @@ private func installationMarker(_ root: URL, _ app: String) -> URL {
         let before = try await old.snapshot()
         try FileManager.default.removeItem(at: installationMarker(root, app))
         calls.deleteFailure = errSecInteractionNotAllowed
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(old)
-        await deviceFailure("device_storage_unavailable") {
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(old)
+        await deviceFailure("failed_precondition") {
             _ = try await transport.acceptSession(deviceRecord(), after: before)
         }
-        await deviceFailure("device_storage_unavailable") { _ = try await loadSession(old, origin: deviceOrigin) }
+        await deviceFailure("failed_precondition") { _ = try await loadSession(old, origin: deviceOrigin) }
         calls.deleteFailure = nil
         #expect(try await deviceStore(root, app, protected: true).load() == nil)
     }
@@ -940,7 +940,7 @@ func deviceInstallMarkerFailurePreservesOwnedCredentials(kind: String) async thr
             damaged = try JSONSerialization.data(withJSONObject: marker)
         }
         try damaged.write(to: markerURL)
-        let code = kind == "version" ? "device_storage_version_unsupported" : "device_storage_corrupt"
+        let code = kind == "version" ? "unimplemented" : "data_loss"
         await deviceFailure(code) { _ = try await store.load() }
         let credentialsPreserved = try keychain.load() == original
         let markerPreserved = try Data(contentsOf: markerURL) == damaged
@@ -968,11 +968,11 @@ func deviceServerSuccessKeepsOnlyThisRunMemoryAfterWriteFailure(postCommitReadFa
             calls.failReadsAfterUpdate = true
         } else {
             calls.updateFailure = errSecInteractionNotAllowed
-            await deviceFailure("device_storage_unavailable") {
+            await deviceFailure("failed_precondition") {
                 _ = try await store.install(signedIn, consumingEmail: nil, ifGeneration: generation)
             }
         }
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         let accepted = try await transport.acceptSession(signedIn, after: before)
         let sessionMatches6 = accepted.sessionID == signedIn.sessionID
         #expect(sessionMatches6)
@@ -1015,10 +1015,10 @@ func deviceRefreshFailureHonorsThePreSendBoundary(afterServerSuccess: Bool) asyn
             let sessionMatches9 = result?.sessionID == replacement.sessionID
             #expect(sessionMatches9)
             #expect(await count.value == 1)
-            await deviceFailure("invalid_token") { _ = try await store.load() }
-        } catch let error as OperationError {
+            await deviceFailure("unauthenticated") { _ = try await store.load() }
+        } catch let error as ClientError {
             #expect(!afterServerSuccess)
-            #expect(error.code == "device_storage_unavailable")
+            #expect(error.code == "failed_precondition")
             #expect(await count.value == 0)
         }
     }
@@ -1065,10 +1065,10 @@ func deviceDamagedStateIsPreservedAndBlocked(kind: String, protected: Bool) asyn
             if let keychain { try FakeKeychainCalls(root: root).remove(service: keychain.service, account: keychain.account) }
             else { try FileManager.default.removeItem(at: #require(stateURL)) }
         } else { try replaceStored(damaged) }
-        let code = kind == "version" ? "device_storage_version_unsupported" : "device_storage_corrupt"
+        let code = kind == "version" ? "unimplemented" : "data_loss"
         await deviceFailure(code) { _ = try await store.load() }
         await deviceFailure(code) { try await store.save(deviceRecord()) }
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         await deviceFailure(code) { _ = try await transport.acceptSession(deviceRecord(), after: before) }
         if kind != "missing" {
             let unchanged = try readStored() == damaged
@@ -1126,7 +1126,7 @@ func deviceKeychainGroupConfirmationFailsBeforeAuthenticationStorage(kind: Strin
         }
         let store = try DeviceSessionStore(origin: deviceOrigin, app: app, project: "project", environment: "test",
                                            persist: .dir(root.path), keychainCalls: calls, protected: true)
-        await deviceFailure("device_storage_unavailable") { _ = try await store.snapshot() }
+        await deviceFailure("failed_precondition") { _ = try await store.snapshot() }
         #expect(calls.authenticationGroups.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: installationMarker(root, app).path))
         if kind != "bundle" { #expect(calls.probeDeletes > 0) }
@@ -1139,7 +1139,7 @@ func deviceKeychainGroupConfirmationFailsBeforeAuthenticationStorage(kind: Strin
         calls.failure = errSecInteractionNotAllowed
         let keychain = DeviceKeychain(service: "com.chickinfry.device." + app,
                                        account: UUID().uuidString, calls: calls)
-        await deviceFailure("device_storage_unavailable") { try keychain.create(Data("non-secret".utf8)) }
+        await deviceFailure("failed_precondition") { try keychain.create(Data("non-secret".utf8)) }
     }
 }
 
@@ -1197,7 +1197,7 @@ func deviceRejoinRefreshMarkerIdentity(kind: String) async throws {
             #expect({ recovered?.credential == replacement.credential }())
         } else {
             do { #expect(try await loadSession(store, origin: deviceOrigin) == nil) }
-            catch let error as OperationError { #expect(error.code == "invalid_token") }
+            catch let error as ClientError { #expect(error.code == "unauthenticated") }
         }
         let result = try #require(JSONSerialization.jsonObject(with: keychain.load()) as? [String: Any])
         #expect({ (result["refreshUncertain"] as? Bool) == (kind != "own") }())
@@ -1226,7 +1226,7 @@ func deviceRejoinRefreshMarkerIdentity(kind: String) async throws {
         let encoded = try #require(JSONSerialization.jsonObject(with: decoded.encoded()) as? [String: Any])
         #expect((encoded["refreshRequestID"] as? String) == id)
         let reopened = try deviceStore(root, app, protected: true)
-        await deviceFailure("invalid_token") { _ = try await reopened.load() }
+        await deviceFailure("unauthenticated") { _ = try await reopened.load() }
     }
 }
 
@@ -1239,7 +1239,7 @@ func deviceRejoinRefreshMarkerIdentity(kind: String) async throws {
         let peerID = UUID().uuidString
         let racing = RacingConfirmationStore(store, beforeReplace: { try rejoinRefreshMarker(root, app, id: peerID) })
         do { #expect(try await store.coordinator.refresh(expected: original, store: racing) { replacement } == nil) }
-        catch let error as OperationError { #expect(error.code == "session_store_error") }
+        catch let error as ClientError { #expect(error.code == "failed_precondition") }
         let raw = try #require(JSONSerialization.jsonObject(with: fixtureKeychain(root, app).load()) as? [String: Any])
         #expect({ raw["refreshUncertain"] as? Bool == true }())
         #expect({ raw["refreshRequestID"] as? String == peerID }())
@@ -1257,7 +1257,7 @@ func deviceRejoinRejectsInvalidRefreshMarkersWithoutChangingStorage(active: Bool
         state["refreshRequestID"] = active ? "not-a-uuid" : UUID().uuidString
         let damaged = try JSONSerialization.data(withJSONObject: state)
         try keychain.replace(damaged)
-        await deviceFailure("device_storage_corrupt") { _ = try await store.load() }
+        await deviceFailure("data_loss") { _ = try await store.load() }
         let preserved = try keychain.load() == damaged
         #expect(preserved)
     }
@@ -1314,7 +1314,7 @@ func deviceRejoinNeverUsesMemoryOverPeerAuthentication(kind: String) async throw
         let memory = try rejoinRecord(matching: original)
         calls.failAfterUpdating = kind == "postcommit-rotated"
         if !calls.failAfterUpdating { calls.updateFailure = errSecInteractionNotAllowed }
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         _ = try await transport.acceptSession(memory, after: before)
         calls.failAfterUpdating = false
         calls.updateFailure = nil
@@ -1328,7 +1328,7 @@ func deviceRejoinNeverUsesMemoryOverPeerAuthentication(kind: String) async throw
             } else { $0.session = StoredSession(peer) }
         }
         if kind == "pending" || kind == "marker-rotated" {
-            await deviceFailure("invalid_token") { _ = try await loadSession(store, origin: deviceOrigin) }
+            await deviceFailure("unauthenticated") { _ = try await loadSession(store, origin: deviceOrigin) }
         } else {
             let result = try await loadSession(store, origin: deviceOrigin)
             if kind == "unknown" { #expect(result == nil) }
@@ -1398,7 +1398,7 @@ func deviceRejoinOwnRefreshPreservesPeerPendingAndItsBlock(authChanged: Bool) as
         let before = try await store.snapshot(preparingAuthentication: true)
         let signedIn = try deviceRecord()
         calls.updateFailure = errSecInteractionNotAllowed
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
         calls.updateFailure = nil
         try rejoinPeer(root, app) {
             $0.session = StoredSession(signedIn)
@@ -1424,7 +1424,7 @@ func deviceRejoinRecognizesAppliedAuthenticationAndKeepsPeerAttempts(peerChanged
         let before = try await store.snapshot()
         let signedIn = try deviceRecord()
         calls.failAfterUpdating = true
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
         calls.failAfterUpdating = false
         let peer = rejoinAttempt(screen: "peer")
         if peerChanged { try rejoinPeer(root, app) { $0.attempts.append(peer) } }
@@ -1433,7 +1433,7 @@ func deviceRejoinRecognizesAppliedAuthenticationAndKeepsPeerAttempts(peerChanged
         if peerChanged { #expect(try await store.attempt(screen: "peer")?.id == peer.id) }
         let latest = try await store.snapshot()
         let late = try deviceRecord()
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
         let current = try await loadSession(store, origin: deviceOrigin)
         #expect({ current?.credential == signedIn.credential }())
         #expect(try await store.snapshot().authGeneration == latest.authGeneration)
@@ -1454,7 +1454,7 @@ func deviceRejoinAuthenticationPersistsConsumptionWithoutResurrectingPeerDeletes
         let before = try await store.snapshot()
         let session = try deviceRecord()
         calls.updateFailure = errSecInteractionNotAllowed
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(session, after: before, consuming: consumed)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(session, after: before, consuming: consumed)
         calls.updateFailure = nil
         let peer = rejoinAttempt(screen: "peer", sequence: 20)
         let peerSession = try rejoinRecord(matching: #require(before.session))
@@ -1475,7 +1475,7 @@ func deviceRejoinAuthenticationPersistsConsumptionWithoutResurrectingPeerDeletes
         #expect(try await store.snapshot().attempts.map(\.id) == [peer.id])
         if !peerRotated {
             let late = try deviceRecord()
-            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
+            _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(late, after: before)
             let afterLateReply = try await store.load()
             #expect({ afterLateReply?.credential == session.credential }())
         }
@@ -1492,7 +1492,7 @@ func deviceRejoinRecognizesItsLatestVolatileRefreshAfterAnUncertainRecoveryWrite
         let before = try await store.snapshot()
         let signedIn = try deviceRecord()
         calls.updateFailure = errSecInteractionNotAllowed
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
         let memory = try #require(await loadSession(store, origin: deviceOrigin))
         let beforeRefresh = try await store.snapshot()
         let refreshed = try newSession ? deviceRecord() : rejoinRecord(matching: memory)
@@ -1504,7 +1504,7 @@ func deviceRejoinRecognizesItsLatestVolatileRefreshAfterAnUncertainRecoveryWrite
         let afterRefresh = try await store.snapshot()
         #expect(afterRefresh.authGeneration == beforeRefresh.authGeneration + (newSession ? 1 : 0))
         if newSession {
-            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
+            _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
             let afterLateMemoryReply = try await loadSession(store, origin: deviceOrigin)
             #expect({ afterLateMemoryReply?.credential == refreshed.credential }())
         }
@@ -1516,7 +1516,7 @@ func deviceRejoinRecognizesItsLatestVolatileRefreshAfterAnUncertainRecoveryWrite
         let settled = try await loadSession(store, origin: deviceOrigin)
         #expect({ settled?.credential == refreshed.credential }())
         if newSession {
-            _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
+            _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(deviceRecord(), after: beforeRefresh)
             let afterLateReply = try await loadSession(store, origin: deviceOrigin)
             #expect({ afterLateReply?.credential == refreshed.credential }())
         }
@@ -1536,7 +1536,7 @@ func deviceRejoinPreservesEarlierAppliedGenerationAfterVolatileRefresh(peerChang
         #expect(before.authGeneration == 1)
         let signedIn = try deviceRecord()
         calls.failAfterUpdating = true
-        _ = try await ClientTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
+        _ = try await HTTPTransport(origin: deviceOrigin).withSession(store).acceptSession(signedIn, after: before)
         calls.failAfterUpdating = false
         let applied = try JSONDecoder().decode(DeviceState.self, from: fixtureKeychain(root, app).load())
         #expect({ applied.session == StoredSession(signedIn) }())
@@ -1596,8 +1596,8 @@ func deviceRejoinExplicitAuthenticationClearsObservedPeerMarks(cleanupFails: Boo
             do {
                 _ = try await store.snapshot(preparingAuthentication: true)
                 Issue.record("Expected authentication preparation to fail")
-            } catch let error as OperationError {
-                #expect(error.code == "device_storage_unavailable")
+            } catch let error as ClientError {
+                #expect(error.code == "failed_precondition")
                 #expect(error.devicePreparation)
             }
             calls.updateFailure = nil
@@ -1616,7 +1616,7 @@ func deviceRejoinExplicitAuthenticationClearsObservedPeerMarks(cleanupFails: Boo
         #expect(try await store.attempt(screen: signup.screen)?.id == signup.id)
         #expect(try await store.attempt(screen: other.screen)?.id == other.id)
         let signedIn = try deviceRecord()
-        let transport = try ClientTransport(origin: deviceOrigin).withSession(store)
+        let transport = try HTTPTransport(origin: deviceOrigin).withSession(store)
         _ = try await transport.acceptSession(signedIn, after: before)
         _ = try await transport.acceptSession(deviceRecord(), after: peerBefore)
         let result = try await loadSession(store, origin: deviceOrigin)
@@ -1650,10 +1650,10 @@ func deviceRejoinExplicitAuthenticationClearsObservedPeerMarks(cleanupFails: Boo
         try await store.save(deviceRecord())
         let before = try await store.snapshot()
         calls.updateFailure = errSecInteractionNotAllowed
-        await deviceFailure("device_storage_unavailable") { _ = try await store.logout(ifGeneration: before.generation) }
+        await deviceFailure("failed_precondition") { _ = try await store.logout(ifGeneration: before.generation) }
         calls.updateFailure = nil
         try rejoinPeer(root, app) { $0.attempts.append(rejoinAttempt(screen: "peer")) }
-        await deviceFailure("device_storage_unavailable") { _ = try await loadSession(store, origin: deviceOrigin) }
+        await deviceFailure("failed_precondition") { _ = try await loadSession(store, origin: deviceOrigin) }
     }
 }
 

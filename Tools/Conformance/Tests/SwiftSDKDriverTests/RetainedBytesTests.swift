@@ -146,7 +146,7 @@ final class TestPeer: @unchecked Sendable {
         let oracle = Oracle()
         let context = Conformance.Call(event: { oracle.event($0) }, barrier: { _, _ in }, clear: { _, _ in },
                                        buffers: { oracle.inspect($0, $1) })
-        let transport = try ClientTransport(origin: origin)
+        let transport = try HTTPTransport(origin: origin)
         let result = try await Conformance.$call.withValue(context) {
             try await PlainBridge(transport).call("probe.echo", input: .object(["wire_value": .string("oracle")]))
         }
@@ -185,7 +185,7 @@ private func checkPreviousExchangeOwners(reverse: Bool) async throws {
                                         "observed_at": "2026-10-15T01:02:03.123456789Z"])
     let peer = try TestPeer(responses: [(401, Data("{\"error\":\"invalid_token\"}".utf8)), (200, refresh), (200, body)], chunkSize: reverse ? 97 : 4096)
     let origin = try await peer.start()
-    let store = try MemorySessionStore(origin: origin)
+    let store = try MemoryStore(origin: origin)
     try await store.save(SessionRecord(origin: origin, accessToken: oracleToken(), refreshToken: oracleToken(),
                                       expiresAt: "2026-10-15T01:02:03Z", refreshExpiresAt: "2026-11-15T01:02:03Z",
                                       userID: "user", sessionID: "session"))
@@ -197,7 +197,7 @@ private func checkPreviousExchangeOwners(reverse: Bool) async throws {
                                            oracle.release(reverse: reverse, keepingLast: true)
                                        }
                                    })
-    let transport = try ClientTransport(origin: origin).withSession(store)
+    let transport = try HTTPTransport(origin: origin).withSession(store)
     _ = try await Conformance.$call.withValue(context) {
         try await AuthBridge(transport).call("probe.echo", input: .object(["wire_value": .string("oracle")]))
     }

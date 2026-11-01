@@ -4,14 +4,21 @@ import FoundationNetworking
 #endif
 
 /// The JSON operation boundary used by generated clients.
-public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+public protocol Transport: Sendable {
+    func invoke<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ operation: String, input: Input, as outputType: Output.Type
+    ) async throws -> Output
+}
+
+/// An HTTP implementation of the operation boundary.
+public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let origin: String
     private let timeout: TimeInterval
     private let bearer: String?
     private let store: (any SessionStore)?
 
     // Default reflection includes private credentials, so expose no stored properties.
-    public var description: String { "ClientTransport" }
+    public var description: String { "HTTPTransport" }
     public var debugDescription: String { description }
     public var customMirror: Mirror {
         Mirror(self, children: EmptyCollection<Mirror.Child>(), displayStyle: .struct)
@@ -21,7 +28,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         self.origin = try Self.validateOrigin(origin)
         // The SDK deadline must also fit the monotonic nanosecond timer.
         guard timeout.isFinite, timeout > 0, timeout < Double(Int64.max) / 1_000_000_000 else {
-            throw OperationError(code: "invalid_input", status: nil)
+            throw ClientError(code: "invalid_input", status: nil)
         }
         self.timeout = timeout
         self.bearer = nil
@@ -43,7 +50,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
 
     /// Uses the store's shared refresh coordinator; the original transport is unchanged.
     public func withSession(_ store: any SessionStore) throws -> Self {
-        guard store.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard store.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         return Self(origin: origin, timeout: timeout, bearer: nil, store: store)
     }
 
@@ -56,7 +63,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
     public func acceptSession(_ session: SessionRecord, after before: DeviceSnapshot,
                                consuming attempt: DeviceAttempt? = nil,
                                confirmedEmail: String? = nil) async throws -> SessionRecord {
-        guard session.origin == origin else { throw OperationError(code: "invalid_origin", status: nil) }
+        guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         guard let store else { return session }
         var value = session
         value.deviceGeneration = before.generation
@@ -82,7 +89,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         guard token.utf8.count == 43,
               token.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
                   || (48...57).contains($0) || $0 == 45 || $0 == 95 }) else {
-            throw OperationError(code: "invalid_token", status: nil)
+            throw ClientError(code: "invalid_token", status: nil)
         }
     }
 
@@ -101,20 +108,20 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         _ = try deadline.remaining()
         guard operation.range(of: "\\A[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*\\z",
                               options: .regularExpression) != nil else {
-            throw OperationError(code: "invalid_input", status: nil)
+            throw ClientError(code: "invalid_input", status: nil)
         }
         let body: Data
         do {
             body = try JSONEncoder().encode(input)
         } catch {
-            throw OperationError(code: "invalid_input", status: nil)
+            throw ClientError(code: "invalid_input", status: nil)
         }
         guard body.count <= 4 * 1024 * 1024 else {
-            throw OperationError(code: "request_too_large", status: nil)
+            throw ClientError(code: "request_too_large", status: nil)
         }
         guard (try? JSONSerialization.jsonObject(with: body)) is [String: Any],
               let url = URL(string: origin + "/" + operation) else {
-            throw OperationError(code: "invalid_input", status: nil)
+            throw ClientError(code: "invalid_input", status: nil)
         }
         let stored: SessionRecord?
         if let store {
@@ -193,7 +200,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
             receiver.fail(code: "cancelled")
         }
         guard let status = response.status else {
-            throw OperationError(code: "invalid_response", status: nil)
+            throw ClientError(code: "invalid_response", status: nil)
         }
         #if CHICKINFRY_CONFORMANCE
         observation?.inspect(Conformance.Buffers(
@@ -204,13 +211,13 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
             }))
         #endif
         guard Self.validUTF8(response.body) else {
-            throw OperationError(code: "invalid_response", status: status)
+            throw ClientError(code: "invalid_response", status: status)
         }
         if !(200..<300).contains(status) {
             let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: response.body)
             let code = envelope?.error
             let valid = code?.range(of: "\\A[a-z_]+\\z", options: .regularExpression) != nil
-            guard valid else { throw OperationError(code: "invalid_response", status: status) }
+            guard valid else { throw ClientError(code: "invalid_response", status: status) }
             #if CHICKINFRY_CONFORMANCE
             observation?.confirmedOutcome()
             #endif
@@ -219,14 +226,14 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
         let output: Output
         do {
             guard (try JSONSerialization.jsonObject(with: response.body)) is [String: Any] else {
-                throw OperationError(code: "invalid_response", status: status)
+                throw ClientError(code: "invalid_response", status: status)
             }
             output = try JSONDecoder().decode(outputType, from: response.body)
         } catch {
-            throw OperationError(code: "invalid_response", status: status)
+            throw ClientError(code: "invalid_response", status: status)
         }
         do { _ = try deadline.remaining() }
-        catch let error as OperationError { throw OperationError(code: error.code, status: status) }
+        catch let error as ClientError { throw ClientError(code: error.reason, status: status) }
         #if CHICKINFRY_CONFORMANCE
         observation?.confirmedOutcome()
         #endif
@@ -246,7 +253,7 @@ public struct ClientTransport: Sendable, CustomStringConvertible, CustomDebugStr
     }
 
     static func validateOrigin(_ raw: String) throws -> String {
-        let failure = OperationError(code: "invalid_origin", status: nil)
+        let failure = ClientError(code: "invalid_origin", status: nil)
         // Inspect the raw authority before Foundation can normalize numeric hosts or escapes.
         guard !raw.contains("?"), !raw.contains("#"), !raw.contains("@"),
               !raw.contains("%"), !raw.contains("\\"),
@@ -314,10 +321,10 @@ private struct RefreshOutput: Decodable, Sendable {
         refresh_expires_at = try values.decode(String.self, forKey: .refresh_expires_at)
         user_id = try values.decode(String.self, forKey: .user_id)
         session_id = try values.decode(String.self, forKey: .session_id)
-        try ClientTransport.validateToken(access_token)
-        try ClientTransport.validateToken(refresh_token)
+        try HTTPTransport.validateToken(access_token)
+        try HTTPTransport.validateToken(refresh_token)
         guard !expires_at.isEmpty, !refresh_expires_at.isEmpty, !user_id.isEmpty, !session_id.isEmpty else {
-            throw OperationError(code: "invalid_response", status: nil)
+            throw ClientError(code: "invalid_response", status: nil)
         }
     }
 
@@ -393,7 +400,7 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
             observation?.observe("cancel-requested", immediate: true)
             #endif
             task.cancel()
-            continuation.resume(throwing: OperationError(code: "cancelled", status: nil))
+            continuation.resume(throwing: ClientError(code: "cancelled", status: nil))
         }
     }
 
@@ -428,7 +435,7 @@ private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @uncheck
                 #endif
                 task.cancel()
             }
-            continuation?.resume(throwing: OperationError(code: code, status: response.status))
+            continuation?.resume(throwing: ClientError(code: code, status: response.status))
         } else {
             continuation?.resume(returning: response)
         }

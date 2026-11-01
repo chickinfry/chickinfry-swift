@@ -58,13 +58,13 @@ private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server
         return request.headers["authorization"] == "Bearer " + oldAccess
             ? .reply(401, unauthorized) : .reply(200, validBody)
     })
-    let store = try MemorySessionStore(origin: server.origin)
+    let store = try MemoryStore(origin: server.origin)
     let old = try SessionRecord(origin: server.origin, accessToken: oldAccess, refreshToken: randomToken(),
                                 expiresAt: "original", refreshExpiresAt: "original", userID: "user", sessionID: "session")
     try await store.save(old)
-    let transport = try ClientTransport(origin: server.origin).withSession(store)
+    let transport = try HTTPTransport(origin: server.origin).withSession(store)
     let first = Task { try await transport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
-    let otherTransport = try ClientTransport(origin: server.origin).withSession(store)
+    let otherTransport = try HTTPTransport(origin: server.origin).withSession(store)
     let second = Task { try await otherTransport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
     let joined = await waitForFlight(store.coordinator, count: 2, server: server)
     await gate.open()
@@ -114,13 +114,13 @@ private final class RefreshHooks: @unchecked Sendable {
             return request.headers["authorization"] == "Bearer " + old.accessToken
                 ? .reply(401, unauthorized) : .reply(200, validBody)
         })
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(SessionRecord(origin: server.origin, accessToken: old.accessToken,
                                           refreshToken: old.refreshToken, expiresAt: old.expiresAt,
                                           refreshExpiresAt: old.refreshExpiresAt,
                                           userID: old.userID, sessionID: old.sessionID))
-        let firstTransport = try ClientTransport(origin: server.origin).withSession(store)
-        let secondTransport = try ClientTransport(origin: server.origin).withSession(store)
+        let firstTransport = try HTTPTransport(origin: server.origin).withSession(store)
+        let secondTransport = try HTTPTransport(origin: server.origin).withSession(store)
         let hooks = RefreshHooks()
         let leaderEntered = PeerGate()
         let followerEntered = PeerGate()
@@ -146,7 +146,7 @@ private final class RefreshHooks: @unchecked Sendable {
                 await (leader ? leaderEntered : followerEntered).open()
                 let released = await (leader ? leaderRelease : followerRelease).wait()
                 try Task.checkCancellation()
-                guard released else { throw OperationError(code: "hook_failed", status: nil) }
+                guard released else { throw ClientError(code: "hook_failed", status: nil) }
             }, clear: { _, _ in })
         }
         let leaderContext = context(leader: true)
@@ -187,7 +187,7 @@ private final class RefreshHooks: @unchecked Sendable {
             if case .success = await second.result { Issue.record("Shutdown completed a held call successfully") }
         case "cancel":
             first.cancel()
-            await expectFailure("cancelled", status: nil) { _ = try await first.value }
+            await expectFailure("canceled", status: nil) { _ = try await first.value }
             // Cancellation can finish the call before its barrier hook unwinds.
             #expect(await leaderExited.wait())
             #expect(hooks.state.pending == 1)
@@ -197,7 +197,7 @@ private final class RefreshHooks: @unchecked Sendable {
         case "failure":
             leaderRelease.finish(false)
             followerRelease.finish(true)
-            await expectFailure("hook_failed", status: nil) { _ = try await first.value }
+            await expectFailure("unknown", status: nil) { _ = try await first.value }
             #expect(try await second.value.value == "ok")
         default:
             let releaseLeader = action == "release-leader"
@@ -307,12 +307,12 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
         return request.headers["authorization"] == "Bearer " + old.accessToken
             ? .reply(401, unauthorized) : .reply(201, validBody)
     })
-    let store = try MemorySessionStore(origin: server.origin)
+    let store = try MemoryStore(origin: server.origin)
     try await store.save(SessionRecord(origin: server.origin, accessToken: old.accessToken,
                                       refreshToken: old.refreshToken, expiresAt: old.expiresAt,
                                       refreshExpiresAt: old.refreshExpiresAt,
                                       userID: old.userID, sessionID: old.sessionID))
-    let transport = try ClientTransport(origin: server.origin).withSession(store)
+    let transport = try HTTPTransport(origin: server.origin).withSession(store)
     let leaderEvents = RefreshEvents()
     let followerEvents = RefreshEvents()
     func call(_ events: RefreshEvents, joined: PeerGate) async throws -> Payload {
@@ -331,7 +331,7 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
     for task in [leader, follower] {
         if refreshStatus == 200 { #expect(try await task.value.value == "ok") }
         else {
-            await expectFailure(refreshStatus == 500 ? "operation_failed" : "invalid_response", status: refreshStatus) {
+            await expectFailure(refreshStatus == 500 ? "operation_failed" : "internal", status: refreshStatus) {
                 _ = try await task.value
             }
         }
@@ -370,9 +370,9 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
     let refreshed = try record("https://example.com")
     try await withPeer([.reply(401, unauthorized), .reply(200, try wire(refreshed)),
                         .reply(401, unauthorized), .reply(200, try wire(refreshed)), .reply(200, validBody)]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(record(server.origin))
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
         await expectFailure("invalid_token", status: 401) {
             let _: Payload = try await transport.invoke("notes.write", input: Empty())
         }
@@ -385,27 +385,27 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
     let cases: [(PeerResponse, String, Int?)] = [
         (.reply(429, Data("{\"error\":\"rate_limited\"}".utf8)), "rate_limited", 429),
         (.reply(500, Data("{\"error\":\"operation_failed\"}".utf8)), "operation_failed", 500),
-        (.reply(201, Data("{}".utf8)), "invalid_response", 201),
-        (.disconnect, "transport_error", nil),
-        (.gatedReply(200, validBody, timeoutGate), "timeout", nil),
-        (.reply(401, Data(repeating: 32, count: 1024 * 1024 + 1)), "response_too_large", 401),
+        (.reply(201, Data("{}".utf8)), "internal", 201),
+        (.disconnect, "unavailable", nil),
+        (.gatedReply(200, validBody, timeoutGate), "deadline_exceeded", nil),
+        (.reply(401, Data(repeating: 32, count: 1024 * 1024 + 1)), "resource_exhausted", 401),
     ]
     for (response, code, status) in cases {
         try await withPeer([.reply(401, unauthorized), response, .reply(401, unauthorized), .reply(200, validBody)]) { server in
-            let store = try MemorySessionStore(origin: server.origin)
+            let store = try MemoryStore(origin: server.origin)
             let original = try record(server.origin)
             try await store.save(original)
-            let transport = try ClientTransport(origin: server.origin, timeout: 30).withSession(store)
+            let transport = try HTTPTransport(origin: server.origin, timeout: 30).withSession(store)
             let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
             await server.log.waitForRequests(2)
             await expectFailure(code, status: status) { _ = try await call.value }
-            if code == "timeout" { await timeoutGate.open() }
+            if code == "deadline_exceeded" { await timeoutGate.open() }
             let saved = try await store.load()
             let originalPreserved = saved.map { sameRecord($0, original) } ?? false
             #expect(originalPreserved)
             // Saving the same credential must not reset its unknown consumption result.
             try await store.save(original)
-            await expectFailure("invalid_token", status: 401) {
+            await expectFailure("unauthenticated", status: nil) {
                 let _: Payload = try await transport.invoke("notes.write", input: Empty())
             }
             #expect(await server.log.requests.filter { $0.path == "/auth.refresh" }.count == 1)
@@ -424,12 +424,12 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
         return request.headers["authorization"] == "Bearer " + original.accessToken
             ? .gatedReply(401, unauthorized, originalGate) : .gatedReply(200, validBody, retryGate)
     })
-    let store = try MemorySessionStore(origin: server.origin)
+    let store = try MemoryStore(origin: server.origin)
     try await store.save(SessionRecord(origin: server.origin, accessToken: original.accessToken,
                                       refreshToken: original.refreshToken, expiresAt: original.expiresAt,
                                       refreshExpiresAt: original.refreshExpiresAt,
                                       userID: original.userID, sessionID: original.sessionID))
-    let transport = try ClientTransport(origin: server.origin, timeout: 30).withSession(store)
+    let transport = try HTTPTransport(origin: server.origin, timeout: 30).withSession(store)
     let call = Task { try await transport.invoke("posts.echo", input: Empty(), as: Payload.self) }
     await server.log.waitForRequests(1)
     try await Task.sleep(nanoseconds: 15_000_000_000)
@@ -440,7 +440,7 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
         try? await Task.sleep(nanoseconds: 20_000_000_000)
         await retryGate.open()
     }
-    await expectFailure("timeout", status: nil) { _ = try await call.value }
+    await expectFailure("deadline_exceeded", status: nil) { _ = try await call.value }
     await release.value
     #expect(await server.log.requests.map(\.path) == ["/posts.echo", "/auth.refresh", "/posts.echo"])
     await server.stop()
@@ -450,12 +450,12 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
     let gate = PeerGate()
     try await withPeer([.gatedReply(401, unauthorized, gate), .reply(401, unauthorized),
                         .disconnect, .reply(200, validBody)]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(record(server.origin))
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
         let late = Task { try await transport.invoke("posts.echo", input: Empty(), as: Payload.self) }
         await server.log.waitForRequests(1)
-        await expectFailure("transport_error", status: nil) {
+        await expectFailure("unavailable", status: nil) {
             let _: Payload = try await transport.invoke("posts.echo", input: Empty())
         }
         let newLogin = try record(server.origin)
@@ -483,9 +483,9 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
     let refreshed = try wire(record("https://example.com"))
     try await withPeer([.reply(401, unauthorized), .gatedReply(200, refreshed, gate),
                         .reply(200, validBody)]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(record(server.origin))
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
         let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
         await server.log.waitForRequests(2)
         let newLogin = try record(server.origin)
@@ -508,9 +508,9 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
 @Test func testRejectedRefreshPreservesNewLogin() async throws {
     let gate = PeerGate()
     try await withPeer([.reply(401, unauthorized), .gatedReply(401, unauthorized, gate)]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(record(server.origin))
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
         let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
         await server.log.waitForRequests(2)
         let newLogin = try record(server.origin)
@@ -531,11 +531,11 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
 
 @Test func testUncertainRefreshKeepsStoredCredential() async throws {
     try await withPeer([.reply(401, unauthorized), .disconnect]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         let original = try record(server.origin)
         try await store.save(original)
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
-        await expectFailure("transport_error", status: nil) {
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
+        await expectFailure("unavailable", status: nil) {
             let _: Payload = try await transport.invoke("notes.write", input: Empty())
         }
         let saved = try #require(await store.load())
@@ -551,11 +551,11 @@ func sharedRefreshProjectsTheDecidingExchange(refreshStatus: Int) async throws {
         var incomplete = complete
         incomplete[field] = nil
         try await withPeer([.reply(401, unauthorized), .reply(200, try JSONEncoder().encode(incomplete))]) { server in
-            let store = try MemorySessionStore(origin: server.origin)
+            let store = try MemoryStore(origin: server.origin)
             let original = try record(server.origin)
             try await store.save(original)
-            let transport = try ClientTransport(origin: server.origin).withSession(store)
-            await expectFailure("invalid_response", status: 200) {
+            let transport = try HTTPTransport(origin: server.origin).withSession(store)
+            await expectFailure("internal", status: 200) {
                 let _: Payload = try await transport.invoke("notes.write", input: Empty())
             }
             let saved = try #require(await store.load())
@@ -591,13 +591,13 @@ private actor FailingStore: SessionStore {
         try await withPeer([.reply(401, unauthorized), stage == "clear" ? .reply(401, unauthorized) : .reply(200, refreshed),
                             .reply(401, unauthorized)]) { server in
             let store = FailingStore(origin: server.origin, record: try record(server.origin), failure: stage)
-            let transport = try ClientTransport(origin: server.origin).withSession(store)
-            await expectFailure("session_store_error", status: nil) {
+            let transport = try HTTPTransport(origin: server.origin).withSession(store)
+            await expectFailure("failed_precondition", status: nil) {
                 let _: Payload = try await transport.invoke("notes.write", input: Empty())
             }
             if stage == "load" { #expect(await server.log.requests.isEmpty) }
             else {
-                await expectFailure("invalid_token", status: 401) {
+                await expectFailure("unauthenticated", status: nil) {
                     let _: Payload = try await transport.invoke("notes.write", input: Empty())
                 }
                 #expect(await server.log.requests.filter { $0.path == "/auth.refresh" }.count == 1)
@@ -610,9 +610,9 @@ private actor FailingStore: SessionStore {
     for (status, code, operation) in [(403, "invalid_token", "notes.write"), (401, "denied", "notes.write"),
                                     (401, "invalid_token", "auth.refresh")] {
         try await withPeer([.reply(status, try JSONEncoder().encode(["error": code]))]) { server in
-            let store = try MemorySessionStore(origin: server.origin)
+            let store = try MemoryStore(origin: server.origin)
             try await store.save(record(server.origin))
-            let transport = try ClientTransport(origin: server.origin).withSession(store)
+            let transport = try HTTPTransport(origin: server.origin).withSession(store)
             await expectFailure(code, status: status) {
                 let _: Payload = try await transport.invoke(operation, input: Empty())
             }
@@ -623,10 +623,10 @@ private actor FailingStore: SessionStore {
 
 @Test func sessionOriginCopiesAndRedaction() async throws {
     try await withPeer(Array(repeating: .reply(200, validBody), count: 3)) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         let session = try record(server.origin)
         try await store.save(session)
-        let anonymous = try ClientTransport(origin: server.origin)
+        let anonymous = try HTTPTransport(origin: server.origin)
         let authenticated = try anonymous.withSession(store)
         let explicit = try authenticated.withBearer(randomToken())
         for transport in [anonymous, authenticated, explicit] {
@@ -637,12 +637,12 @@ private actor FailingStore: SessionStore {
         let storedBearer = requests[1].headers["authorization"] == "Bearer " + session.accessToken
         #expect(storedBearer)
         #expect(requests[2].headers["authorization"] != nil)
-        let other = try MemorySessionStore(origin: "https://example.com")
-        #expect(throws: OperationError.self) { try anonymous.withSession(other) }
-        await #expect(throws: OperationError.self) { try await other.save(session) }
+        let other = try MemoryStore(origin: "https://example.com")
+        await expectFailure("failed_precondition", status: nil) { _ = try anonymous.withSession(other) }
+        await expectFailure("failed_precondition", status: nil) { try await other.save(session) }
         let wrongOrigin = FailingStore(origin: server.origin, record: try record("https://example.com"), failure: "none")
         let mismatched = try anonymous.withSession(wrongOrigin)
-        await expectFailure("session_store_error", status: nil) {
+        await expectFailure("failed_precondition", status: nil) {
             let _: Payload = try await mismatched.invoke("notes.read", input: Empty())
         }
         #expect(await server.log.requests.count == 3)
@@ -661,15 +661,15 @@ private actor FailingStore: SessionStore {
     let server = try LoopbackServer(responder: { request in
         request.path == "/auth.refresh" ? .gatedReply(200, refreshed, gate) : .reply(401, unauthorized)
     })
-    let store = try MemorySessionStore(origin: server.origin)
+    let store = try MemoryStore(origin: server.origin)
     try await store.save(record(server.origin))
-    let transport = try ClientTransport(origin: server.origin).withSession(store)
+    let transport = try HTTPTransport(origin: server.origin).withSession(store)
     let first = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
     let second = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
     let joined = await waitForFlight(store.coordinator, count: 2, server: server)
     #expect(joined)
     first.cancel()
-    await expectFailure("cancelled", status: nil) { _ = try await first.value }
+    await expectFailure("canceled", status: nil) { _ = try await first.value }
     await gate.open()
     await expectFailure("invalid_token", status: 401) { _ = try await second.value }
     #expect(await server.log.requests.filter { $0.path == "/auth.refresh" }.count == 1)
@@ -698,11 +698,11 @@ private actor WaitingStore: SessionStore {
         for cancel in [false, true] {
             let gate = PeerGate()
             let store = WaitingStore(origin: server.origin, gate: gate)
-            let transport = try ClientTransport(origin: server.origin, timeout: 30).withSession(store)
+            let transport = try HTTPTransport(origin: server.origin, timeout: 30).withSession(store)
             let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
             await store.entered.wait()
             if cancel { call.cancel() }
-            await expectFailure(cancel ? "cancelled" : "timeout", status: nil) { _ = try await call.value }
+            await expectFailure(cancel ? "canceled" : "deadline_exceeded", status: nil) { _ = try await call.value }
             await gate.open()
         }
         #expect(await server.log.requests.isEmpty)
@@ -711,18 +711,18 @@ private actor WaitingStore: SessionStore {
 
 @Test func lastCancelledWaiterDoesNotReuseRefresh() async throws {
     try await withPeer([.reply(401, unauthorized), .stall(false), .reply(401, unauthorized)]) { server in
-        let store = try MemorySessionStore(origin: server.origin)
+        let store = try MemoryStore(origin: server.origin)
         try await store.save(record(server.origin))
-        let transport = try ClientTransport(origin: server.origin).withSession(store)
+        let transport = try HTTPTransport(origin: server.origin).withSession(store)
         let call = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
         await server.log.waitForRequests(2)
         call.cancel()
-        await expectFailure("cancelled", status: nil) { _ = try await call.value }
+        await expectFailure("canceled", status: nil) { _ = try await call.value }
         #if CHICKINFRY_CONFORMANCE
         await store.coordinator.conformanceShutdown()
         #expect(await store.coordinator.conformanceTaskCount == 0)
         #endif
-        await expectFailure("invalid_token", status: 401) {
+        await expectFailure("unauthenticated", status: nil) {
             let _: Payload = try await transport.invoke("notes.write", input: Empty())
         }
         await server.log.waitForCompletions(3)
@@ -743,10 +743,10 @@ private struct SlowDecodedOutput: Decodable, Sendable {
 
 @Test func callDeadlineIncludesResponseDecoding() async throws {
     try await withPeer([.reply(200, validBody)]) { server in
-        let transport = try ClientTransport(origin: server.origin, timeout: 30)
+        let transport = try HTTPTransport(origin: server.origin, timeout: 30)
         let call = Task { try await transport.invoke("notes.read", input: Empty(), as: SlowDecodedOutput.self) }
         await SlowDecodedOutput.entered.wait()
-        await expectFailure("timeout", status: 200) { _ = try await call.value }
+        await expectFailure("deadline_exceeded", status: 200) { _ = try await call.value }
         #expect(await server.log.requests.count == 1)
     }
 }
