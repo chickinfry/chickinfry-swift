@@ -8,6 +8,9 @@ public struct RequestContext: Codable, Sendable {
     public let method: String
     public let uri: String
     public let headers: [String: String]
+    var databaseHost: HostRequest? = nil
+
+    private enum CodingKeys: String, CodingKey { case method, uri, headers }
 
     public init(method: String, uri: String, headers: [String: String]) {
         self.method = method
@@ -108,7 +111,10 @@ public struct Application: Sendable {
         guard body.count <= 4 << 20 else { return .failure("request_too_large", status: 413) }
         do {
             let parsed = try JSONBody.parse(body)
-            return await target.invoke(parsed, context)
+            // Retained contexts must keep their original request authority.
+            var bound = context
+            bound.databaseHost = HostRequest.current
+            return await target.invoke(parsed, bound)
         } catch let error as JSONBody.Failure {
             return .failure(error.rawValue, status: 400)
         } catch {

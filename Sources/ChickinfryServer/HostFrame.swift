@@ -4,11 +4,11 @@ import FoundationEssentials
 import Foundation
 #endif
 
-enum HostValue: Codable, Sendable, Equatable {
+@_spi(Generated) public enum HostValue: Codable, Sendable, Equatable {
     case null, bool(Bool), integer(Int64), number(Double), string(String)
     case array([HostValue]), object([String: HostValue])
 
-    init(from decoder: any Decoder) throws {
+    public init(from decoder: any Decoder) throws {
         let value = try decoder.singleValueContainer()
         if value.decodeNil() { self = .null }
         else if let flag = try? value.decode(Bool.self) { self = .bool(flag) }
@@ -23,7 +23,7 @@ enum HostValue: Codable, Sendable, Equatable {
         else { self = .object(try value.decode([String: HostValue].self)) }
     }
 
-    func encode(to encoder: any Encoder) throws {
+    public func encode(to encoder: any Encoder) throws {
         var value = encoder.singleValueContainer()
         switch self {
         case .null: try value.encodeNil()

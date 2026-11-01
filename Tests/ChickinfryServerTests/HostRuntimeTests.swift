@@ -404,7 +404,7 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
 
 @Test func retainedAliasCannotStartIOFromAnUncancelledTask() async throws {
     let calls = AsyncStream<HostCall>.makeStream()
-    let aliases = AsyncStream<HostRequest>.makeStream()
+    let aliases = AsyncStream<RequestContext>.makeStream()
     let gate = UncooperativeGate()
     let acknowledgements = AsyncStream<Void>.makeStream()
     let responses = AsyncStream<Void>.makeStream()
@@ -416,10 +416,14 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
             if call.channel == .finish { acknowledgements.continuation.yield(()) }
         }
     }
-    try await runtime.start(1, rid: 71) {
-        aliases.continuation.yield(try #require(HostRequest.current))
+    struct Empty: Codable, Sendable {}
+    let application = Application(operations: [Operation("capture", input: Empty.self) { context, _ in
+        aliases.continuation.yield(context)
         await gate.wait()
-        return ok
+        return Empty()
+    }])
+    try await runtime.start(1, rid: 71) {
+        await application.handle("capture", body: bytes("{}"), context: RequestContext(method: "POST", uri: "/capture", headers: [:]))
     }
     var iterator = aliases.stream.makeAsyncIterator()
     let alias = try #require(await iterator.next())
@@ -427,7 +431,7 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
     var cleanup = acknowledgements.stream.makeAsyncIterator()
     _ = await cleanup.next()
     await #expect(throws: CancellationError.self) {
-        _ = try await alias.database(bytes(#"{"op":"query","sql":"forbidden","params":[]}"#))
+        _ = try await _DatabaseConnection(alias).query("forbidden", [])
     }
     await gate.open()
     var settled = responses.stream.makeAsyncIterator()
@@ -448,4 +452,50 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
     #expect(finish.channel == .finish)
     await h.reply(finish)
     #expect(await responses.next() == 1)
+}
+
+@Test func generatedDatabaseRejectsUnsafeColumnsAndValuesBeforeHostIO() async throws {
+    struct Row: Decodable, Sendable { let id: String; let count: Int }
+    let h = Harness()
+    var calls = h.calls.makeAsyncIterator()
+    var results = h.results.makeAsyncIterator()
+    try await h.runtime.start(1, rid: 17) {
+        var context = RequestContext(method: "POST", uri: "/records", headers: [:])
+        context.databaseHost = HostRequest.current
+        let repository = _Repository<Row>(_DatabaseConnection(context), table: "records", primaryKey: ["id"], columns: [
+            _DatabaseColumn("id", kind: "id", nullable: false, optional: false),
+            _DatabaseColumn("count", kind: "integer", nullable: false, optional: false)
+        ])
+        await #expect(throws: DatabaseError.self) {
+            _ = try await repository.findMany(FindMany(where: Field<String>("records", "id; DROP TABLE records").eq("value")))
+        }
+        await #expect(throws: DatabaseError.self) {
+            _ = try await repository.insert(["id": .string("value"), "count": .integer(2_147_483_648)])
+        }
+        await #expect(throws: DatabaseError.self) {
+            _ = try await repository.update(["id": .string("value")], ["count": .null])
+        }
+        return ok
+    }
+    let finish = try #require(await calls.next())
+    #expect(finish.channel == .finish)
+    await h.reply(finish)
+    #expect(await results.next()?.status == 200)
+}
+
+@Test(arguments: [
+    ("2026-10-14 00:00:00.123456+00", "2026-10-14T00:00:00.123456Z"),
+    ("2026-10-14T09:00:00.12+09:00", "2026-10-14T00:00:00.120Z"),
+    ("2024-03-01T00:30:00+01:00", "2024-02-29T23:30:00.000Z"),
+    ("2024-12-31T23:30:00-01:00", "2025-01-01T00:30:00.000Z")
+])
+func generatedTimestampPreservesTextPrecision(_ value: String, _ expected: String) throws {
+    let column = _DatabaseColumn("stamp", kind: "timestamp", nullable: false, optional: false)
+    #expect(try column.normalized(.string(value)) == .string(expected))
+}
+
+@Test(arguments: ["infinity", "2023-02-29T00:00:00Z", "2024-01-01T24:00:00Z", "2024-01-01T00:00:00.1234567Z", "0001-01-01T00:00:00+01:00"])
+func generatedTimestampRejectsInvalidCalendarValues(_ value: String) throws {
+    let column = _DatabaseColumn("stamp", kind: "timestamp", nullable: false, optional: false)
+    #expect(throws: DatabaseError.self) { try column.normalized(.string(value)) }
 }
