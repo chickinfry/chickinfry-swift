@@ -19,8 +19,9 @@ private final class Output: @unchecked Sendable {
         let driver: Driver
         do {
             let args = Array(CommandLine.arguments.dropFirst())
-            guard args.count == 4, args[0] == "--plain-sdk", args[2] == "--auth-sdk",
-                  args[1].hasPrefix("/"), args[3].hasPrefix("/") else { throw ProtocolFailure.violation }
+            guard (args.count == 4 || args.count == 6), args[0] == "--plain-sdk", args[2] == "--auth-sdk",
+                  args[1].hasPrefix("/"), args[3].hasPrefix("/"),
+                  args.count == 4 || (args[4] == "--required-auth-sdk" && args[5].hasPrefix("/")) else { throw ProtocolFailure.violation }
             let credentials = try loadCredentials(descriptor: 3)
             let output = Output()
             driver = Driver(credentials: credentials, output: { try output.write($0) })

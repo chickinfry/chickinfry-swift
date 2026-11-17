@@ -1,4 +1,5 @@
 import Foundation
+import Chickinfry
 import Testing
 @testable import SwiftSDKDriver
 #if canImport(Darwin)
@@ -437,5 +438,72 @@ private func randomSessionToken() -> String {
     #expect(result["error"]["code"] == .string("deadline_exceeded"))
     #expect(result["error"]["outcomeUnknown"] == .bool(false))
     #expect(peer.connectionCount == 0)
+    await driver.shutdown()
+}
+
+@Test func requiredAuthBridgeRejectsBothTargetsAndPreservesErrors() async throws {
+    let invalidCode = try JSONEncoder().encode(["error": "invalid_code"])
+    let unverified = try JSONEncoder().encode(["error": "email_not_verified"])
+    let peer = try TestPeer(responses: [(400, invalidCode), (403, unverified)], chunkSize: 4096)
+    let origin = try await peer.start()
+    defer { peer.stop() }
+    let bridge = RequiredAuthBridge(try HTTPTransport(origin: origin))
+    do {
+        _ = try await bridge.call("auth.verify_email", input: .object([
+            "attempt": .string("attempt"), "email": .string("person@example.test"), "code": .string("000000"),
+        ]))
+        Issue.record("Both targets were accepted")
+    } catch let error as ClientError {
+        #expect(error.code == "invalid_argument")
+    }
+    #expect(peer.connectionCount == 0)
+    do {
+        _ = try await bridge.call("auth.verify_email", input: .object([
+            "attempt": .string("attempt"), "code": .string("000000"),
+        ]))
+        Issue.record("Invalid code was accepted")
+    } catch let error as OperationError {
+        #expect(error.code == "invalid_code")
+        #expect(error.status == 400)
+    }
+    do {
+        _ = try await bridge.call("auth.signin", input: .object([
+            "email": .string("person@example.test"), "password": .string("test-password"),
+        ]))
+        Issue.record("Unverified account was accepted")
+    } catch let error as OperationError {
+        #expect(error.code == "email_not_verified")
+        #expect(error.status == 403)
+    }
+    #expect(peer.connectionCount == 2)
+}
+
+@Test func knownReturnedCredentialsUseReferencesWithoutExplicitOutputRefs() async throws {
+    let access = randomSessionToken()
+    let refresh = randomSessionToken()
+    let body = try JSONEncoder().encode([
+        "access_token": access, "refresh_token": refresh, "expires_at": "later", "refresh_expires_at": "later",
+        "user_id": UUID().uuidString, "session_id": UUID().uuidString,
+    ])
+    let peer = try TestPeer(body: body, chunkSize: 4096)
+    let origin = try await peer.start()
+    defer { peer.stop() }
+    let messages = Messages()
+    let driver = Driver(credentials: ["access": access, "refresh": refresh], output: { messages.append($0) })
+    try await handshake(driver)
+    let common: [String: JSON] = ["caseId": .string("case"), "timeoutMs": .int(5000)]
+    try await driver.receive(request("c:create", "client.create", common.merging([
+        "clientRef": .string("client"), "fixture": .string("auth"), "origin": .string(origin), "requestTimeoutMs": .int(1000),
+    ]) { _, new in new }))
+    _ = try await messages.wait { $0["id"] == .string("c:create") }
+    try await driver.receive(request("c:login", "client.call", common.merging([
+        "clientRef": .string("client"), "operation": .string("auth.signin"),
+        "input": .object(["email": .string("person@example.test"), "password": .string("test-password")]),
+    ]) { _, new in new }))
+    let response = try await messages.wait { $0["id"] == .string("c:login") }
+    #expect(response["result"]["credentialRefs"]["access_token"] == .string("access"))
+    #expect(response["result"]["credentialRefs"]["refresh_token"] == .string("refresh"))
+    #expect(response["result"]["output"]["access_token"] == .null)
+    #expect(response["result"]["output"]["refresh_token"] == .null)
     await driver.shutdown()
 }

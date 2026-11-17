@@ -5,6 +5,8 @@ public struct ClientError: Error, Sendable, LocalizedError, CustomStringConverti
     let reason: String
     public let status: Int?
 
+    @_spi(Generated) public static var invalidArgument: ClientError { ClientError(code: "invalid_input", status: nil) }
+
     init(code: String, status: Int?) {
         self.reason = code == "invalid_token" && status == 401 ? "refresh_blocked" : code
         self.status = code == "invalid_token" && status == 401 ? nil : status
