@@ -46,6 +46,9 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
     private var usesVolatileSession = false
     private var volatileBlocked = false
     private var mutationEpoch: UInt64 = 0
+    private var adoptingSession = false
+
+    var authenticationEpoch: UInt64 { mutationEpoch }
 
     func authenticationSnapshot(_ snapshot: DeviceSnapshot, store: any DeviceAuthenticationStore) async throws -> DeviceSnapshot {
         var value = snapshot
@@ -144,7 +147,13 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         return latest.attempts.contains { $0.id == consuming.id && $0.screen == consuming.screen && $0.email == consuming.email }
     }
 
-    func current(store: any SessionStore) async throws -> SessionRecord? {
+    func checkInvocation(_ record: SessionRecord?) throws {
+        guard !volatileBlocked, record.map({ !uncertain.contains($0.credential) }) ?? true else {
+            throw ClientError(code: "refresh_blocked", status: nil)
+        }
+    }
+
+    func current(store: any SessionStore, forInvocation: Bool = false) async throws -> SessionRecord? {
         if let device = store as? DeviceSessionStore { try await device.prepareInstallation() }
         if usesVolatileSession {
             if let device = store as? any DeviceAuthenticationStore {
@@ -165,7 +174,10 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
             }
             return volatileBlocked ? nil : volatileSession
         }
-        return try await sessionStoreCall { try await store.load() }
+        return try await sessionStoreCall {
+            if forInvocation, let device = store as? DeviceSessionStore { return try await device.loadForInvocation() }
+            return try await store.load()
+        }
     }
 
     func discardVolatileSession() {
@@ -233,7 +245,28 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         return session
     }
 
-    private func clearAuthenticated(_ expected: SessionRecord, store: any SessionStore) async throws -> Bool {
+    func adoptSession(_ session: SessionRecord, store: any SessionStore,
+                      expected: SessionRecord?, epoch: UInt64) async throws {
+        let changed = ClientError(code: "session_changed", status: nil)
+        guard epoch == mutationEpoch, !adoptingSession else { throw changed }
+        adoptingSession = true
+        defer { adoptingSession = false }
+
+        if let expected {
+            guard try await sessionStoreCall({ try await store.replace(session, ifMatching: expected) }) else {
+                throw changed
+            }
+        } else {
+            let current = try await loadSession(store, origin: session.origin, forInvocation: true)
+            guard current == nil, epoch == mutationEpoch else { throw changed }
+            try Task.checkCancellation()
+            // shortcut: external empty-store writes require app coordination until the store supports atomic insertion.
+            try await sessionStoreCall { try await store.save(session) }
+        }
+        mutationEpoch &+= 1
+    }
+
+    func clearAuthenticated(_ expected: SessionRecord, store: any SessionStore) async throws -> Bool {
         if usesVolatileSession {
             guard volatileSession?.credential == expected.credential else { return false }
             volatileSession = nil
@@ -241,7 +274,9 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
             mutationEpoch &+= 1
             return true
         }
-        return try await sessionStoreCall { try await store.clear(ifMatching: expected) }
+        let removed = try await sessionStoreCall { try await store.clear(ifMatching: expected) }
+        if removed { mutationEpoch &+= 1 }
+        return removed
     }
     #if CHICKINFRY_CONFORMANCE
     private var conformanceWork: [UUID: Task<Void, Never>] = [:]
@@ -316,7 +351,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                         // Recheck after selection: storage I/O must not split flight publication.
                         let current = try await loadSession(store, origin: expected.origin)
                         if current?.credential != key {
-                            result = .success(current)
+                            result = .success(current.flatMap { expected.sameLogin(as: $0) ? $0 : nil })
                         } else {
                             guard !self.uncertain.contains(key) else {
                                 throw ClientError(code: "invalid_token", status: 401)
@@ -367,9 +402,12 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
                                                           refreshRequestID: ownedExpected.deviceRefreshRequestID)
                             }
                             let refreshExpected = ownedExpected
-                            result = .success(try await self.acceptAuthenticated(refreshed, store: store, expected: expected,
-                                                                                authGeneration: recovery?.authGeneration, recovery: recovery) {
+                            let accepted = try await self.acceptAuthenticated(refreshed, store: store, expected: expected,
+                                                                               authGeneration: recovery?.authGeneration, recovery: recovery) {
                                 try await self.commitRefresh(refreshed, expected: refreshExpected, store: store)
+                            }
+                            result = .success(accepted.flatMap {
+                                $0.credential == refreshed.credential || expected.sameLogin(as: $0) ? $0 : nil
                             })
                             unknown = false
                         }

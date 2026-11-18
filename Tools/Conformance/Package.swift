@@ -10,6 +10,7 @@ let package = Package(
         .package(path: "../../sdk/plain"),
         .package(path: "../../sdk/auth"),
         .package(path: "../../sdk/requiredAuth"),
+        .package(path: "../../sdk/emptySession"),
     ],
     targets: [
         .executableTarget(name: "SwiftSDKDriver", dependencies: [
@@ -17,6 +18,7 @@ let package = Package(
             .product(name: "ChickinfryClientPlain", package: "plain"),
             .product(name: "ChickinfryClientAuth", package: "auth"),
             .product(name: "ChickinfryClientRequiredAuth", package: "requiredAuth"),
+            .product(name: "ChickinfryClientEmptySession", package: "emptySession"),
         ]),
         .testTarget(name: "SwiftSDKDriverTests", dependencies: ["SwiftSDKDriver"]),
     ],

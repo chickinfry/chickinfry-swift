@@ -11,6 +11,7 @@ private struct ClientEntry: Sendable {
     let plain: PlainBridge?
     let auth: AuthBridge?
     let requiredAuth: RequiredAuthBridge?
+    let emptySession: EmptySessionBridge?
 
     init(transport: HTTPTransport, fixture: String, store: ObservedStore?) {
         self.transport = transport
@@ -19,6 +20,7 @@ private struct ClientEntry: Sendable {
         plain = fixture == "plain" ? PlainBridge(transport) : nil
         auth = fixture == "auth" ? AuthBridge(transport) : nil
         requiredAuth = fixture == "requiredAuth" ? RequiredAuthBridge(transport) : nil
+        emptySession = fixture == "emptySession" ? EmptySessionBridge(transport) : nil
     }
 }
 
@@ -183,7 +185,7 @@ actor Driver {
                 guard clients[name] == nil, !(args.object?["storeRef"] != nil && args.object?["bearerRef"] != nil),
                       let timeout = args["requestTimeoutMs"].integer, timeout > 0 else { throw ProtocolFailure.invalidArgs }
                 let fixture = try args.text("fixture")
-                guard ["plain", "auth", "requiredAuth"].contains(fixture) else { throw ProtocolFailure.invalidArgs }
+                guard ["plain", "auth", "requiredAuth", "emptySession"].contains(fixture) else { throw ProtocolFailure.invalidArgs }
                 var transport = try HTTPTransport(origin: args.text("origin"), timeout: Double(timeout) / 1000)
                 var store: ObservedStore?
                 if args.object?["storeRef"] != nil {
@@ -246,6 +248,7 @@ actor Driver {
                 raw = try await Conformance.$call.withValue(context) {
                     if let plain = client.plain { return try await plain.call(operation, input: .object(input)) }
                     if let required = client.requiredAuth { return try await required.call(operation, input: .object(input)) }
+                    if let empty = client.emptySession { return try await empty.call(operation, input: .object(input)) }
                     return try await client.auth!.call(operation, input: .object(input))
                 }
             } catch {

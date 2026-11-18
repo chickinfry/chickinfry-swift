@@ -355,8 +355,19 @@ public actor DeviceSessionStore: SessionStore, DeviceRefreshing, DeviceAuthentic
     #endif
 
     public func load() async throws -> SessionRecord? {
+        try load(rejectBlocked: false)
+    }
+
+    func loadForInvocation() throws -> SessionRecord? {
+        try load(rejectBlocked: true)
+    }
+
+    private func load(rejectBlocked: Bool) throws -> SessionRecord? {
         try transaction { state in
-            if recoveryBlocked(state) { return (nil, false) }
+            if recoveryBlocked(state) {
+                if rejectBlocked { throw ClientError(code: "invalid_token", status: 401) }
+                return (nil, false)
+            }
             if state.authenticationSwitches.contains(where: { !context.knowsSwitch($0.id) }) {
                 state.session = nil
                 state.authenticationSwitches = []

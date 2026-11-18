@@ -43,7 +43,13 @@ public struct ClientError: Error, Sendable, LocalizedError, CustomStringConverti
             "The server origin is invalid. Use HTTPS or an explicit loopback HTTP origin without credentials, a path, query, or fragment."
         case "invalid_input":
             "The request is invalid. Check the operation, JSON object, and timeout settings."
-        case "invalid_token", "session_changed", "refresh_blocked":
+        case "missing_session":
+            "This operation requires an authenticated session."
+        case "session_changed":
+            "The session changed while this operation was in progress."
+        case "refresh_blocked":
+            "The session is unavailable after an unconfirmed refresh."
+        case "invalid_token":
             "The access token is invalid. Sign in again before calling this operation."
         case "session_store_error":
             "The session store could not complete the operation. Check your session storage before trying again."

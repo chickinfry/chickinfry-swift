@@ -4,10 +4,13 @@ The driver calls the generated plain and authenticated clients. It uses the
 runtime's session store and conditional conformance SPI; it does not implement
 HTTP, refresh policy, retries, or case verdicts.
 
-Prepare an owned staging root with this repository and three generated SDK packages
-at `sdk/plain`, `sdk/auth`, and `sdk/requiredAuth`. Their package metadata must expose the modules
-`ChickinfryClientPlain`, `ChickinfryClientAuth`, and `ChickinfryClientRequiredAuth`, preserve generated Swift source
-bytes, and use the same staged runtime through local dependencies.
+Prepare an owned staging root with this repository and the generated SDK packages
+at `sdk/plain`, `sdk/auth`, `sdk/requiredAuth`, and `sdk/emptySession`. Their package
+metadata must expose the modules `ChickinfryClientPlain`, `ChickinfryClientAuth`,
+`ChickinfryClientRequiredAuth`, and `ChickinfryClientEmptySession`, preserve generated
+Swift source bytes, and use the same staged runtime through local dependencies.
+The empty-session fixture uses one generated client and the same observed
+session store as the other authentication cases.
 
 The driver executable requires macOS 13 or later. Build once with an installed Swift 6.4 toolchain:
 

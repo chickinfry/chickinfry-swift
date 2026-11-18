@@ -2,6 +2,7 @@
   "protocolVersion": 1,
   "driverVersion": "1.0.0",
   "requiredAuthSDK": true,
+  "emptySessionSDK": true,
   "driverCommit": "fc4161bcf3cfcacdef76f039560ca833bfbac14e",
   "build": {
     "tool": "swift",

@@ -43,6 +43,10 @@ public struct SessionRecord: Sendable, CustomStringConvertible, CustomDebugStrin
         Mirror(self, children: EmptyCollection<Mirror.Child>(), displayStyle: .struct)
     }
 
+    func sameLogin(as other: SessionRecord) -> Bool {
+        userID == other.userID && sessionID == other.sessionID
+    }
+
     var credential: SessionCredential {
         SessionCredential(origin: origin, access: accessToken, refresh: refreshToken)
     }
@@ -96,8 +100,9 @@ protocol DeviceAuthenticationStore: SessionStore {
     func discardAttempt(_ attempt: DeviceAttempt, ifGeneration: UInt64) async throws -> Bool
 }
 
-func loadSession(_ store: any SessionStore, origin: String) async throws -> SessionRecord? {
-    let session = try await store.coordinator.current(store: store)
+func loadSession(_ store: any SessionStore, origin: String, forInvocation: Bool = false) async throws -> SessionRecord? {
+    let session = try await store.coordinator.current(store: store, forInvocation: forInvocation)
+    if forInvocation { try await store.coordinator.checkInvocation(session) }
     guard store.origin == origin, session == nil || session?.origin == origin else {
         throw ClientError(code: "session_store_error", status: nil)
     }

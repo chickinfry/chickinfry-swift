@@ -411,21 +411,19 @@ func deviceVolatileSessionObservesExternalAuthenticationChange(mode: String) asy
             let process = try launchDeviceProbe(root: root, app: app, mode: mode, origin: server.origin)
             process.waitUntilExit()
             #expect(process.terminationStatus == 0)
-            do {
+            let local = await expectFailure("unauthenticated", status: nil) {
                 _ = try await transport.invoke("account.read", input: Empty(), as: Payload.self)
-                Issue.record("The call that detects an authentication change must be unauthenticated")
-            } catch let error as OperationError {
-                #expect(error.status == 401 && error.code == "unauthenticated")
             }
+            #expect(local != nil)
+            #expect(await server.log.requests.isEmpty)
             if mode == "logout-login" {
                 let stored = try #require(await backing.load())
                 let output = try await transport.invoke("account.read", input: Empty(), as: Payload.self)
                 #expect(output.value == "ok")
                 let requests = await server.log.requests
-                #expect(requests.count == 2)
-                let firstWasUnauthenticated = requests[0].headers["authorization"] == nil
-                let nextUsedStoredSession = requests[1].headers["authorization"] == "Bearer " + stored.accessToken
-                #expect(firstWasUnauthenticated && nextUsedStoredSession)
+                try #require(requests.count == 1)
+                let nextUsedStoredSession = requests[0].headers["authorization"] == "Bearer " + stored.accessToken
+                #expect(nextUsedStoredSession)
             }
         } catch {
             await server.stop()
@@ -490,10 +488,10 @@ func deviceRefreshNeverOverwritesAnAuthenticationChange(newLogin: Bool) async th
             if newLogin { try await store.save(changed) }
             return replacement
         }
-        let resultPreservesChange = newLogin ? result?.credential == changed.credential : result == nil
+        #expect(result == nil)
         let stored = try await store.load()
         let diskPreservesChange = newLogin ? stored?.credential == changed.credential : stored == nil
-        #expect(resultPreservesChange && diskPreservesChange)
+        #expect(diskPreservesChange)
     }
 }
 

@@ -8,6 +8,18 @@ public protocol Transport: Sendable {
     func invoke<Input: Encodable & Sendable, Output: Decodable & Sendable>(
         _ operation: String, input: Input, as outputType: Output.Type
     ) async throws -> Output
+
+    func invokePublic<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ operation: String, input: Input, as outputType: Output.Type
+    ) async throws -> Output
+}
+
+extension Transport {
+    public func invokePublic<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ operation: String, input: Input, as outputType: Output.Type
+    ) async throws -> Output {
+        try await invoke(operation, input: input, as: outputType)
+    }
 }
 
 /// An HTTP implementation of the operation boundary.
@@ -65,12 +77,20 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
                                confirmedEmail: String? = nil) async throws -> SessionRecord {
         guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         guard let store else { return session }
+        _ = try await adoptDeviceSession(session, store: store, after: before,
+                                         consuming: attempt, confirmedEmail: confirmedEmail)
+        return session
+    }
+
+    private func adoptDeviceSession(_ session: SessionRecord, store: any SessionStore, after before: DeviceSnapshot,
+                                    consuming attempt: DeviceAttempt? = nil,
+                                    confirmedEmail: String? = nil) async throws -> SessionRecord? {
         var value = session
         value.deviceGeneration = before.generation
         value.deviceAuthGeneration = before.authGeneration
         let accepted = value
         let generation = try await store.coordinator.targetAuthenticationGeneration(before, session: session, consuming: attempt)
-        _ = try await store.coordinator.acceptAuthenticated(accepted, store: store, authGeneration: generation,
+        return try await store.coordinator.acceptAuthenticated(accepted, store: store, authGeneration: generation,
                                                            localAuthGeneration: before.localAuthGeneration, lateIsEmpty: true,
                                                            recovery: DeviceRecovery(before: before, writtenSession: accepted, writtenAuthGeneration: generation, session: accepted,
                                                                                     authGeneration: generation, consuming: attempt,
@@ -82,7 +102,6 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
             try await store.save(accepted)
             return .persisted
         }
-        return session
     }
 
     static func validateToken(_ token: String) throws {
@@ -95,6 +114,18 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
 
     public func invoke<Input: Encodable & Sendable, Output: Decodable & Sendable>(
         _ operation: String, input: Input, as outputType: Output.Type = Output.self
+    ) async throws -> Output {
+        try await invoke(operation, input: input, as: outputType, isPublic: false)
+    }
+
+    public func invokePublic<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ operation: String, input: Input, as outputType: Output.Type = Output.self
+    ) async throws -> Output {
+        try await invoke(operation, input: input, as: outputType, isPublic: true)
+    }
+
+    private func invoke<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ operation: String, input: Input, as outputType: Output.Type, isPublic: Bool
     ) async throws -> Output {
         let deadline = CallDeadline(timeout: timeout)
         #if CHICKINFRY_CONFORMANCE
@@ -123,15 +154,48 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
               let url = URL(string: origin + "/" + operation) else {
             throw ClientError(code: "invalid_input", status: nil)
         }
-        let stored: SessionRecord?
-        if let store {
-            stored = try await deadline.wait { try await loadSession(store, origin: origin) }
-        } else { stored = nil }
+        let authenticates = isPublic && ["auth.signin", "auth.signup", "auth.identity", "auth.verify_email"].contains(operation)
+        let snapshot = store == nil ? (record: nil, adopt: nil)
+            : try await deadline.wait { try await invocationSession(authenticating: authenticates) }
+        let stored = snapshot.record
+        guard store == nil || stored != nil || (isPublic && operation != "auth.refresh") else {
+            throw ClientError(code: "missing_session", status: nil)
+        }
+
+        func perform(_ session: SessionRecord?, adopt: SessionAdoption?, final: Bool) async throws -> Output {
+            let accept: (@Sendable (Data, Int) async throws -> Void)?
+            if let adopt {
+                accept = { data, status in
+                    if operation == "auth.signup", (try? JSONDecoder().decode(PendingSignup.self, from: data)) != nil {
+                        return
+                    }
+                    guard let response = try? JSONDecoder().decode(RefreshOutput.self, from: data),
+                          let record = try? response.record(origin: origin) else {
+                        throw ClientError(code: "invalid_response", status: status)
+                    }
+                    #if CHICKINFRY_CONFORMANCE
+                    Conformance.call?.credentials(record)
+                    #endif
+                    try await deadline.wait { try await adopt(record) }
+                }
+            } else { accept = nil }
+            let output = try await exchange(url: url, body: body, bearer: operation == "auth.refresh" && store != nil
+                                            ? nil : session?.accessToken ?? bearer,
+                                            deadline: deadline, as: outputType, finalExchange: final, accept: accept)
+            if operation == "auth.logout", let store, let session {
+                let removed = try await deadline.wait {
+                    try await store.coordinator.clearAuthenticated(session, store: store)
+                }
+                #if CHICKINFRY_CONFORMANCE
+                Conformance.call?.clear(session, removed)
+                #endif
+                _ = removed
+            }
+            return output
+        }
         do {
             do {
-                return try await exchange(url: url, body: body, bearer: stored?.accessToken ?? bearer,
-                                          deadline: deadline, as: outputType,
-                                          finalExchange: stored == nil || operation == "auth.refresh")
+                return try await perform(stored, adopt: snapshot.adopt, final: stored == nil || operation == "auth.refresh")
             } catch let rejection as ServerRejection where rejection.error.code == "invalid_token" && rejection.error.status == 401 {
                 #if CHICKINFRY_CONFORMANCE
                 try await observation?.barrier("both-originals-rejected", nil)
@@ -153,18 +217,51 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
                         return refreshed
                     }
                 }
-                guard let refreshed else { throw error }
-                return try await exchange(url: url, body: body, bearer: refreshed.accessToken,
-                                          deadline: deadline, as: outputType, finalExchange: true)
+                let latest = try await deadline.wait { try await invocationSession(authenticating: authenticates) }
+                guard let refreshed, let session = latest.record, session.credential == refreshed.credential else {
+                    throw ClientError(code: "session_changed", status: nil)
+                }
+                return try await perform(session, adopt: latest.adopt, final: true)
             }
         } catch let rejection as ServerRejection {
             throw rejection.error
         }
     }
 
+    private typealias SessionAdoption = @Sendable (SessionRecord) async throws -> Void
+
+    private func invocationSession(authenticating: Bool) async throws -> (record: SessionRecord?, adopt: SessionAdoption?) {
+        guard let store else { return (nil, nil) }
+        if let memory = store as? MemoryStore {
+            let snapshot = await memory.snapshot()
+            try await store.coordinator.checkInvocation(snapshot.record)
+            guard authenticating else { return (snapshot.record, nil) }
+            return (snapshot.record, { try await memory.adopt($0, ifRevision: snapshot.revision) })
+        }
+        let epoch = authenticating ? await store.coordinator.authenticationEpoch : nil
+        let record = try await loadSession(store, origin: origin, forInvocation: true)
+        guard let epoch else { return (record, nil) }
+        if let device = store as? any DeviceAuthenticationStore {
+            let before = try await device.snapshot()
+            guard !before.state.refreshUncertain, before.state.session == nil || before.session != nil else {
+                throw ClientError(code: "refresh_blocked", status: nil)
+            }
+            guard before.session?.credential == record?.credential else {
+                throw ClientError(code: "session_changed", status: nil)
+            }
+            return (record, { session in
+                let accepted = try await adoptDeviceSession(session, store: store, after: before)
+                guard accepted?.credential == session.credential else {
+                    throw ClientError(code: "session_changed", status: nil)
+                }
+            })
+        }
+        return (record, { try await store.coordinator.adoptSession($0, store: store, expected: record, epoch: epoch) })
+    }
+
     private func exchange<Output: Decodable & Sendable>(
         url: URL, body: Data, bearer: String?, deadline: CallDeadline, as outputType: Output.Type,
-        finalExchange: Bool = false
+        finalExchange: Bool = false, accept: (@Sendable (Data, Int) async throws -> Void)? = nil
     ) async throws -> Output {
         #if CHICKINFRY_CONFORMANCE
         let observation = Conformance.call
@@ -237,6 +334,7 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
         #if CHICKINFRY_CONFORMANCE
         observation?.confirmedOutcome()
         #endif
+        try await accept?(response.body, status)
         return output
     }
 
@@ -302,6 +400,11 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
         }
         return scheme + "://" + authority
     }
+}
+
+private struct PendingSignup: Decodable {
+    let accepted: Bool
+    let attempt: String
 }
 
 private struct RefreshInput: Encodable { let refresh_token: String }

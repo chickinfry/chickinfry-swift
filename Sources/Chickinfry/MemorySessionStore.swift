@@ -7,12 +7,18 @@ public actor MemoryStore: SessionStore, CustomStringConvertible, CustomDebugStri
     /// The single coordinator shared by every access to this store.
     public nonisolated let coordinator = SessionCoordinator()
     private var session: SessionRecord?
-    #if CHICKINFRY_CONFORMANCE
-    private var conformanceRevision = 0
+    private var revision = 0
 
-    @_spi(Conformance) public func conformanceSnapshot() -> (record: SessionRecord?, revision: Int) {
-        (session, conformanceRevision)
+    func snapshot() -> (record: SessionRecord?, revision: Int) { (session, revision) }
+
+    func adopt(_ session: SessionRecord, ifRevision expected: Int) throws {
+        guard revision == expected else { throw ClientError(code: "session_changed", status: nil) }
+        self.session = session
+        revision += 1
     }
+
+    #if CHICKINFRY_CONFORMANCE
+    @_spi(Conformance) public func conformanceSnapshot() -> (record: SessionRecord?, revision: Int) { snapshot() }
     #endif
 
     /// Creates empty in-process storage, or throws if the origin is invalid.
@@ -27,9 +33,7 @@ public actor MemoryStore: SessionStore, CustomStringConvertible, CustomDebugStri
     public func save(_ session: SessionRecord) async throws {
         guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         self.session = session
-        #if CHICKINFRY_CONFORMANCE
-        conformanceRevision += 1
-        #endif
+        revision += 1
     }
 
     /// Returns true after replacement or false on a credential mismatch or absence; an origin mismatch throws.
@@ -37,9 +41,7 @@ public actor MemoryStore: SessionStore, CustomStringConvertible, CustomDebugStri
         guard session.origin == origin else { throw ClientError(code: "origin_mismatch", status: nil) }
         guard self.session?.credential == expected.credential else { return false }
         self.session = session
-        #if CHICKINFRY_CONFORMANCE
-        conformanceRevision += 1
-        #endif
+        revision += 1
         return true
     }
 
@@ -47,9 +49,7 @@ public actor MemoryStore: SessionStore, CustomStringConvertible, CustomDebugStri
     public func clear(ifMatching expected: SessionRecord) async throws -> Bool {
         guard session?.credential == expected.credential else { return false }
         session = nil
-        #if CHICKINFRY_CONFORMANCE
-        conformanceRevision += 1
-        #endif
+        revision += 1
         return true
     }
 
