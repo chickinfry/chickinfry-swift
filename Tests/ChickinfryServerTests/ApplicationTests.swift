@@ -456,3 +456,88 @@ private func businessErrorCodesMatchEntireASCIIString(_ code: String) async {
     #expect(result.status == 500)
     #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8))
 }
+
+private func authenticatedRequest(
+    _ application: Application, operation: String, auth: String? = nil
+) async -> ServerResponse {
+    let frame = #"""
+        {"operation":"\#(operation)","rid":1,"context":{"request":{"method":"POST","path":"/probe","headers":{
+          "Authorization":"sentinel-bearer","cOoKiE":"sentinel-cookie",
+          "Proxy-Authorization":"sentinel-proxy","x-probe":"ordinary"
+        }}}\#(auth.map { ",\"auth\":\($0)" } ?? "")}
+        """#
+    let body = Data(#"{"value":"ok","auth":{"session":{"id":"caller-supplied"}}}"#.utf8)
+    guard let metadata = try? RequestMetadata(Data(frame.utf8)) else {
+        return .failure("operation_failed", status: 500)
+    }
+    return await application.handle(metadata, body: body)
+}
+
+@Test func protectedOperationRequiresHostSession() async throws {
+    let application = Application(operations: [
+        Operation(protectedOperation: "protected", input: Input.self, handler: { context, _ in
+            context.auth.session
+        })
+    ])
+    let anonymous = await authenticatedRequest(application, operation: "protected", auth: #"{"version":1,"session":null}"#)
+    #expect(anonymous.status == 401)
+    #expect(anonymous.body == Data(#"{"error":"unauthenticated"}"#.utf8))
+    let verified = await authenticatedRequest(application, operation: "protected", auth:
+        #"{"version":1,"session":{"id":"sid","user":{"id":"uid","email":"user@example.test"}}}"#)
+    #expect(verified.status == 200)
+    let session = try JSONDecoder().decode(AuthSession.self, from: verified.body)
+    #expect(session == AuthSession(id: "sid", user: .init(id: "uid", email: "user@example.test")))
+}
+
+@Test func publicOperationUsesNullableSessionAndFilteredHeaders() async throws {
+    struct Observation: Codable {
+        let session: AuthSession?
+        let headers: [String: String]
+    }
+    let application = Application(operations: [
+        Operation(publicOperation: "public", input: Input.self, handler: { context, _ in
+            Observation(session: context.auth.session, headers: context.request.headers)
+        }),
+        Operation("authFree", input: Input.self) { context, _ in context.request.headers },
+    ])
+    let anonymous = await authenticatedRequest(application, operation: "public", auth: #"{"version":1,"session":null}"#)
+    #expect(anonymous.status == 200)
+    let observation = try JSONDecoder().decode(Observation.self, from: anonymous.body)
+    #expect(observation.session == nil)
+    #expect(observation.headers == ["x-probe": "ordinary"])
+    let verified = await authenticatedRequest(application, operation: "public", auth:
+        #"{"version":1,"session":{"id":"public","user":{"id":"uid","email":"user@example.test"}}}"#)
+    #expect(verified.status == 200)
+    #expect(try JSONDecoder().decode(Observation.self, from: verified.body).session?.id == "public")
+
+    let authFree = await authenticatedRequest(application, operation: "authFree")
+    #expect(authFree.status == 200)
+    #expect(try JSONDecoder().decode([String: String].self, from: authFree.body) == [
+        "Authorization": "sentinel-bearer", "cOoKiE": "sentinel-cookie", "x-probe": "ordinary",
+    ])
+}
+
+@Test(arguments: [nil, #"null"#, #"{"version":2,"session":null}"#, #"{"version":1}"#,
+    #"{"version":1,"session":{"id":"sid","user":{"id":"uid","email":true}}}"#,
+    #"{"version":1,"session":{"id":"","user":{"id":"uid","email":"user@example.test"}}}"#,
+    #"{"version":1,"session":null,"session":{"id":"sid","user":{"id":"uid","email":"user@example.test"}}}"#,
+    #"{"version":1,"session":{"id":"sid","user":{"id":"uid","email":"user@example.test"},"emailVerified":true}}"#
+] as [String?])
+func authEnabledOperationRejectsMissingOrMalformedHostFrame(auth: String?) async {
+    let application = Application(operations: [
+        Operation(publicOperation: "public", input: Input.self, handler: { _, _ in "unexpected handler call" })
+    ])
+    let result = await authenticatedRequest(application, operation: "public", auth: auth)
+    #expect(result.status == 500)
+    #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8))
+}
+
+@Test func oversizedAuthMetadataStopsBeforeDispatch() async {
+    let application = Application(operations: [
+        Operation(publicOperation: "public", input: Input.self) { _, _ in "unexpected handler call" }
+    ])
+    let oversizedFrame = #"{"version":1,"session":null}"# + String(repeating: " ", count: 4 << 20)
+    let result = await authenticatedRequest(application, operation: "public", auth: oversizedFrame)
+    #expect(result.status == 500)
+    #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8))
+}

@@ -70,14 +70,9 @@ public enum WasmServer {
 
     public static func handle(_ call: Int32, metadata: UnsafePointer<UInt8>, metadataCount: Int32,
                               body: UnsafePointer<UInt8>, bodyCount: Int32) {
-        struct Metadata: Decodable {
-            let operation: String
-            let context: Context
-            let rid: UInt64?
-            let deadlineMilliseconds: UInt64?
-        }
-        guard call > 0, metadataCount >= 0, bodyCount >= 0, tasks[call] == nil, let application,
-              let frame = try? JSONDecoder().decode(Metadata.self, from: Data(bytes: metadata, count: Int(metadataCount))),
+        guard call > 0, (0...RequestMetadata.byteLimit).contains(Int(metadataCount)),
+              bodyCount >= 0, tasks[call] == nil, let application,
+              let frame = try? RequestMetadata(Data(bytes: metadata, count: Int(metadataCount))),
               frame.deadlineMilliseconds.map({ $0 <= UInt64.max / 1_000_000 }) ?? true else {
             finish(call, response: .failure("operation_failed", status: 500))
             return
@@ -86,11 +81,11 @@ public enum WasmServer {
         let input = Data(bytes: body, count: Int(bodyCount))
         if let rid = frame.rid {
             enqueue(.start(call, rid, frame.deadlineMilliseconds.map { $0 * 1_000_000 }, {
-                await application.handle(frame.operation, body: input, context: frame.context)
+                await application.handle(frame, body: input)
             }))
         } else {
             tasks[call] = Task {
-                let response = await application.handle(frame.operation, body: input, context: frame.context)
+                let response = await application.handle(frame, body: input)
                 finish(call, response: response)
             }
         }

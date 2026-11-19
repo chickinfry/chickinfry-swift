@@ -107,22 +107,55 @@ public struct ServerResponse: Sendable {
 }
 
 public struct Operation: Sendable {
+    enum Policy: Sendable { case authFree, publicAccess, protected }
     let name: String
-    let invoke: @Sendable (JSONValue, Context) async -> ServerResponse
+    let policy: Policy
+    let invoke: @Sendable (JSONValue, Context, AuthSession?) async -> ServerResponse
 
     public init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
         _ name: String, input: Input.Type,
         handler: @escaping @Sendable (Context, Input) async throws -> Output
     ) {
+        self.init(name, input: input, policy: .authFree) { context, value, _ in
+            try await handler(context, value)
+        }
+    }
+
+    @_spi(Generated)
+    public init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
+        publicOperation name: String, input: Input.Type,
+        handler: @escaping @Sendable (AuthenticatedContext<AuthSession?>, Input) async throws -> Output
+    ) {
+        self.init(name, input: input, policy: .publicAccess) { context, value, session in
+            try await handler(AuthenticatedContext(context, session: session), value)
+        }
+    }
+
+    @_spi(Generated)
+    public init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
+        protectedOperation name: String, input: Input.Type,
+        handler: @escaping @Sendable (AuthenticatedContext<AuthSession>, Input) async throws -> Output
+    ) {
+        self.init(name, input: input, policy: .protected) { context, value, session in
+            guard let session else { throw OperationError(code: "unauthenticated", status: 401) }
+            return try await handler(AuthenticatedContext(context, session: session), value)
+        }
+    }
+
+    private init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
+        _ name: String, input: Input.Type, policy: Policy,
+        handler: @escaping @Sendable (Context, Input, AuthSession?) async throws -> Output
+    ) {
         self.name = name
-        invoke = { body, context in
+        self.policy = policy
+        invoke = { body, context, session in
             let value: Input
             do { value = try Input(from: JSONValueDecoder(body)) }
             catch is _InputBudgetExceeded { return .failure("request_too_large", status: 413) }
             catch { return .failure("invalid_input", status: 400) }
             let output: Output
             do {
-                output = try await handler(context, value)
+                output = try await handler(context, value, session)
             } catch let error as OperationError {
                 guard (400...599).contains(error.status), (1...64).contains(error.code.utf8.count),
                       error.code.utf8.allSatisfy({ (97...122).contains($0) || $0 == 95 }) else {
@@ -149,15 +182,36 @@ public struct Application: Sendable {
     }
 
     public func handle(_ operation: String, body: Data, context: Context) async -> ServerResponse {
+        await handle(operation, body: body, context: context, auth: nil)
+    }
+
+    func handle(_ frame: RequestMetadata, body: Data) async -> ServerResponse {
+        await handle(frame.operation, body: body, context: frame.context, auth: frame.auth)
+    }
+
+    private func handle(_ operation: String, body: Data, context: Context, auth: RequestAuth?) async -> ServerResponse {
         guard let target = operations[operation] else { return .failure("not_found", status: 404) }
         guard context.request.method == "POST" else { return .failure("method_not_allowed", status: 405) }
+        let authEnabled = target.policy != .authFree
+        guard authEnabled == (auth != nil) else { return .failure("operation_failed", status: 500) }
+        if target.policy == .protected, auth?.session == nil {
+            return .failure("unauthenticated", status: 401)
+        }
         guard body.count <= 4 << 20 else { return .failure("request_too_large", status: 413) }
         do {
             let parsed = try JSONBody.parse(body)
             // Retained contexts must keep their original request authority.
-            var bound = context
+            let request = context.request
+            let headers = request.headers.filter { header in
+                switch header.key.lowercased() {
+                case "proxy-authorization": return false
+                case "authorization", "cookie": return !authEnabled
+                default: return true
+                }
+            }
+            var bound = Context(request: .init(method: request.method, path: request.path, headers: headers))
             bound.databaseHost = HostRequest.current
-            return await target.invoke(parsed, bound)
+            return await target.invoke(parsed, bound, auth?.session)
         } catch let error as JSONBody.Failure {
             return .failure(error.rawValue, status: 400)
         } catch {
