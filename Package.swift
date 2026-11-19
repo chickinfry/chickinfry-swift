@@ -3,8 +3,21 @@ import PackageDescription
 
 #if os(Linux)
 let defaultTraits: Set<String> = ["ClientTransport"]
+let clientPackages: [Package.Dependency] = [
+    .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.37.0"),
+    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.105.0"),
+    .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.6"),
+]
+let clientProducts: [Target.Dependency] = [
+    .product(name: "AsyncHTTPClient", package: "async-http-client", condition: .when(traits: ["ClientTransport"])),
+    .product(name: "NIOPosix", package: "swift-nio", condition: .when(traits: ["ClientTransport"])),
+    .product(name: "NIOWebSocket", package: "swift-nio", condition: .when(traits: ["ClientTransport"])),
+    .product(name: "NIOSSL", package: "swift-nio-ssl", condition: .when(traits: ["ClientTransport"])),
+]
 #else
 let defaultTraits: Set<String> = []
+let clientPackages: [Package.Dependency] = []
+let clientProducts: [Target.Dependency] = []
 #endif
 
 let package = Package(
@@ -13,12 +26,9 @@ let package = Package(
     products: [.library(name: "Chickinfry", targets: ["Chickinfry"]),
                .library(name: "ChickinfryServer", targets: ["ChickinfryServer"])],
     traits: [.default(enabledTraits: defaultTraits), .trait(name: "ClientTransport")],
-    dependencies: [.package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.37.0")],
+    dependencies: clientPackages,
     targets: [
-        .target(name: "Chickinfry", dependencies: [
-            .product(name: "AsyncHTTPClient", package: "async-http-client",
-                     condition: .when(platforms: [.linux], traits: ["ClientTransport"]))
-        ]),
+        .target(name: "Chickinfry", dependencies: clientProducts),
         .target(name: "ChickinfryServer", dependencies: ["CChickinfryExecutor"]),
         .target(name: "CChickinfryExecutor"),
         .testTarget(name: "ChickinfryServerTests", dependencies: ["ChickinfryServer"]),

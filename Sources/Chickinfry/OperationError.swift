@@ -1,13 +1,16 @@
 import Foundation
 
 /// A safe failure code and the HTTP status, when a response was observed.
-public struct ClientError: Error, Sendable, LocalizedError, CustomStringConvertible {
+public struct ClientError: Error, Sendable, LocalizedError, CustomStringConvertible, CustomNSError {
     let reason: String
     public let status: Int?
 
     @_spi(Generated) public static var invalidArgument: ClientError { ClientError(code: "invalid_input", status: nil) }
 
-    init(code: String, status: Int?) {
+    private let underlying: (any Error)?
+
+    init(code: String, status: Int?, underlying: (any Error)? = nil) {
+        self.underlying = underlying
         self.reason = code == "invalid_token" && status == 401 ? "refresh_blocked" : code
         self.status = code == "invalid_token" && status == 401 ? nil : status
     }
@@ -30,10 +33,19 @@ public struct ClientError: Error, Sendable, LocalizedError, CustomStringConverti
         case "device_storage_corrupt": return "data_loss"
         case "device_storage_version_unsupported": return "unimplemented"
         case "invalid_response": return "internal"
+        case "internal", "permission_denied", "resource_exhausted", "data_loss", "deadline_exceeded",
+             "failed_precondition", "unauthenticated", "unavailable", "canceled", "invalid_argument":
+            return reason
         default: return "unknown"
         }
     }
     var devicePreparation = false
+
+    public var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: description]
+        if let underlying { info[NSUnderlyingErrorKey] = underlying }
+        return info
+    }
 
     public var errorDescription: String? { description }
 

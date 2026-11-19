@@ -1,9 +1,14 @@
-import Chickinfry
+@_spi(Generated) import Chickinfry
 import ChickinfryClientPlain
 
 struct PlainBridge: Sendable {
     let client: ChickinfryClientPlain.Client
     init(_ transport: HTTPTransport) { client = ChickinfryClientPlain.createClient(transport: transport) }
+
+    func realtime() throws -> RealtimeClient {
+        guard let owner = (client as Any) as? any RealtimeClientOwner else { throw ProtocolFailure.unimplemented }
+        return owner.realtime
+    }
 
     func call(_ operation: String, input: JSON) async throws -> [String: JSON] {
         switch operation {

@@ -211,19 +211,7 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
                 let error = rejection.error
                 guard operation != "auth.refresh", let store, let stored else { throw error }
                 let refreshed = try await deadline.wait {
-                    try await store.coordinator.refresh(expected: stored, store: store) {
-                        let refreshDeadline = CallDeadline(timeout: timeout)
-                        let input = RefreshInput(refresh_token: stored.refreshToken)
-                        let bytes = try JSONEncoder().encode(input)
-                        let output: RefreshOutput = try await exchange(
-                            url: URL(string: origin + "/auth.refresh")!, body: bytes, bearer: nil,
-                            deadline: refreshDeadline, as: RefreshOutput.self)
-                        let refreshed = try output.record(origin: origin)
-                        #if CHICKINFRY_CONFORMANCE
-                        observation?.credentials(refreshed)
-                        #endif
-                        return refreshed
-                    }
+                    try await refreshSession(stored, store: store)
                 }
                 let latest = try await deadline.wait { try await invocationSession(authenticating: authenticates) }
                 guard let refreshed, let session = latest.record, session.credential == refreshed.credential else {
@@ -234,6 +222,27 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
         } catch let rejection as ServerRejection {
             throw rejection.error
         }
+    }
+
+    private func refreshSession(_ stored: SessionRecord, store: any SessionStore) async throws -> SessionRecord? {
+        try await store.coordinator.refresh(expected: stored, store: store) {
+            let deadline = CallDeadline(timeout: timeout)
+            let bytes = try JSONEncoder().encode(RefreshInput(refresh_token: stored.refreshToken))
+            let output: RefreshOutput = try await exchange(
+                url: URL(string: origin + "/auth.refresh")!, body: bytes, bearer: nil,
+                deadline: deadline, as: RefreshOutput.self)
+            let refreshed = try output.record(origin: origin)
+            #if CHICKINFRY_CONFORMANCE
+            Conformance.call?.credentials(refreshed)
+            #endif
+            return refreshed
+        }
+    }
+
+    func realtimeRenewal() -> RealtimeRenewal? {
+        guard let store else { return nil }
+        return RealtimeRenewal(read: { try await invocationSession(authenticating: false).record },
+                               refresh: { _ = try await refreshSession($0, store: store) })
     }
 
     private typealias SessionAdoption = @Sendable (SessionRecord) async throws -> Void

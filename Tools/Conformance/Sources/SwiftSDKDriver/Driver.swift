@@ -43,6 +43,8 @@ actor Driver {
     private var callScopes: [String: (String, UInt64)] = [:]
     private var outgoing = 0
     private var negotiated = false
+    private var protocolVersion = 1
+    private var realtimeTrial: RealtimeTrial?
     private var activeCase: String?
     private var closing = false
     private let output: @Sendable (JSON) throws -> Void
@@ -82,13 +84,17 @@ actor Driver {
             guard !negotiated, requests.count == 1 else { throw ProtocolFailure.violation }
             try args.fields(["protocolVersions", "runId", "requiredCapabilities", "target"])
             try args["target"].fields(["language", "role", "environment"])
-            guard args["protocolVersions"].array?.contains(.int(1)) == true else {
+            let versions = args["protocolVersions"].array ?? []
+            let requested = args["requiredCapabilities"].array ?? []
+            let protocolVersion = versions.contains(.int(2)) && requested.contains(.string("realtime-v1")) ? 2 : 1
+            guard versions.contains(.int(protocolVersion)) else {
                 try reply(id, error: failure("protocol_mismatch"))
                 closing = true
                 return
             }
+            let available = capabilities + (protocolVersion == 2 ? ["realtime-v1"] : [])
             guard let required = args["requiredCapabilities"].array,
-                  required.allSatisfy({ $0.string.map(capabilities.contains) ?? false }) else {
+                  required.allSatisfy({ $0.string.map(available.contains) ?? false }) else {
                 try reply(id, error: failure("unimplemented", kind: "unimplemented"))
                 return
             }
@@ -98,8 +104,9 @@ actor Driver {
                 throw ProtocolFailure.violation
             }
             negotiated = true
-            try reply(id, result: .object(["protocolVersion": .int(1), "driverVersion": .string(driverVersion),
-                                           "capabilities": .array(capabilities.map(JSON.string))]))
+            self.protocolVersion = protocolVersion
+            try reply(id, result: .object(["protocolVersion": .int(protocolVersion), "driverVersion": .string(driverVersion),
+                                           "capabilities": .array(available.map(JSON.string))]))
             return
         }
         guard negotiated else { throw ProtocolFailure.violation }
@@ -175,9 +182,29 @@ actor Driver {
             guard validRef(value) else { throw ProtocolFailure.invalidArgs }
             return value
         }
+        if command.hasPrefix("realtime.") {
+            guard protocolVersion == 2 else { throw ProtocolFailure.unimplemented }
+            if command == "realtime.start" {
+                try fields(["clientRef", "channel", "onGap", "eventHandler", "transport"])
+                guard realtimeTrial == nil, let entry = clients[try ref("clientRef")],
+                      let plain = entry.plain else { throw ProtocolFailure.invalidArgs }
+                let trial = try RealtimeTrial(client: plain.realtime(), plain: plain, origin: entry.transport.origin, args: args)
+                realtimeTrial = trial
+                await trial.start()
+                return .object(["accepted": .bool(true)])
+            }
+            let required: Set<String> = switch command {
+            case "realtime.observe": ["point", "observation"]
+            case "realtime.release": ["point"]
+            default: []
+            }
+            try fields(required)
+            guard let realtimeTrial else { throw ProtocolFailure.invalidArgs }
+            return try await realtimeTrial.command(command, args: args)
+        }
         switch command {
         case "client.create":
-            try fields(["clientRef", "fixture", "origin", "requestTimeoutMs"], optional: ["storeRef", "bearerRef"])
+            try fields(["clientRef", "fixture", "origin", "requestTimeoutMs"], optional: protocolVersion == 2 ? ["storeRef", "bearerRef", "transport"] : ["storeRef", "bearerRef"])
             let construction = Conformance.Construction()
             defer { constructorCounts[id] = construction.count }
             return try Conformance.$construction.withValue(construction) {
@@ -185,6 +212,9 @@ actor Driver {
                 guard clients[name] == nil, !(args.object?["storeRef"] != nil && args.object?["bearerRef"] != nil),
                       let timeout = args["requestTimeoutMs"].integer, timeout > 0 else { throw ProtocolFailure.invalidArgs }
                 let fixture = try args.text("fixture")
+                if protocolVersion == 2 && (fixture != "plain" || args["transport"] != .string("plain")) {
+                    throw ProtocolFailure.invalidArgs
+                }
                 guard ["plain", "auth", "requiredAuth", "emptySession"].contains(fixture) else { throw ProtocolFailure.invalidArgs }
                 var transport = try HTTPTransport(origin: args.text("origin"), timeout: Double(timeout) / 1000)
                 var store: ObservedStore?
@@ -402,6 +432,7 @@ actor Driver {
     }
 
     func shutdown() async {
+        await realtimeTrial?.close()
         closing = true
         let outstanding = Array(tasks.values)
         for task in outstanding { task.cancel() }
