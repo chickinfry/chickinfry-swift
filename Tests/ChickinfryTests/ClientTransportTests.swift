@@ -169,6 +169,8 @@ func expectFailure(_ code: String, status: Int?,
     }
 }
 
+#if canImport(Darwin)
+// The SDK does not support Linux FoundationNetworking, which buffers 301 bodies and can crash on the redirect callback.
 @Test func everyRedirectIsRejectedWithoutForwardingBearer() async throws {
     try await withPeer { destination in
         let statuses = Array(301...308)
@@ -189,6 +191,7 @@ func expectFailure(_ code: String, status: Int?,
     }
 }
 
+// The header-status assertion requires Apple URLSession; FoundationNetworking on Linux is outside SDK support.
 @Test(arguments: [false, true]) func deadlineCancelsSilentAndTricklingPeers(headers: Bool) async throws {
     let reply = PeerGate()
     try await withPeer([.stall(headers), .gatedReply(200, validBody, reply)]) { server in
@@ -211,6 +214,8 @@ func expectFailure(_ code: String, status: Int?,
         #expect(try await next.value.value == "ok")
     }
 }
+
+#endif
 
 @Test func errorEnvelopeClassificationAndRedaction() async throws {
     let invalid = ["not JSON: secret", "{}", "{\"value\":\"secret\"}", "{\"error\":\"\"}",

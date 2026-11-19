@@ -1,3 +1,5 @@
+#if canImport(Darwin)
+// The SDK does not support Linux FoundationNetworking, which buffers 301 bodies and can crash on the redirect callback.
 import Foundation
 import Testing
 @testable import Chickinfry
@@ -37,3 +39,4 @@ import Testing
         }
     }
 }
+#endif

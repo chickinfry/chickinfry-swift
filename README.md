@@ -2,6 +2,8 @@
 
 This package is under development and is not marked as supported until verification is complete.
 
+The Swift SDK targets iOS, macOS, tvOS, watchOS, and visionOS.
+
 ## Installation
 
 Add the package to your app's `Package.swift` dependencies:

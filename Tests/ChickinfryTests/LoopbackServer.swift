@@ -112,7 +112,11 @@ final class LoopbackServer: Sendable {
                 while true {
                     let client: Int32 = await withCheckedContinuation { continuation in
                         DispatchQueue.global().async {
-                            continuation.resume(returning: accept(descriptor, nil, nil))
+                            var accepted: Int32
+                            // Child-process signals can interrupt the accept without closing the listener.
+                            repeat { accepted = accept(descriptor, nil, nil) }
+                            while accepted < 0 && errno == EINTR
+                            continuation.resume(returning: accepted)
                         }
                     }
                     guard client >= 0 else { return }

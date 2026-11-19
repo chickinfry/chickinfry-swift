@@ -32,15 +32,20 @@ private func sameRecord(_ actual: SessionRecord, _ expected: SessionRecord) -> B
 
 private let unauthorized = Data("{\"error\":\"invalid_token\"}".utf8)
 
-private func waitForFlight(_ coordinator: SessionCoordinator, count: Int, server: LoopbackServer) async -> Bool {
-    let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
-    while DispatchTime.now().uptimeNanoseconds < deadline {
-        if await coordinator.waitingCount >= count { return true }
-        // A broken merger must produce a numerical failure, not a hung barrier.
-        if await server.log.requests.filter({ $0.path == "/auth.refresh" }).count >= count { return false }
-        await Task.yield()
+private func waitForFlight(_ joins: AsyncStream<Int>, count: Int) async -> Bool {
+    await withTaskGroup(of: Bool.self) { group in
+        group.addTask {
+            for await joined in joins where joined >= count { return true }
+            return false
+        }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(5))
+            return false
+        }
+        let joined = await group.next() ?? false
+        group.cancelAll()
+        return joined
     }
-    return false
 }
 
 private final class CustomSessionStore: SessionStore {
@@ -166,11 +171,12 @@ func testLateSigninCannotResurrectAClearedSession(storeFixture: SessionStoreFixt
     let old = try SessionRecord(origin: server.origin, accessToken: oldAccess, refreshToken: randomToken(),
                                 expiresAt: "original", refreshExpiresAt: "original", userID: "user", sessionID: "session")
     try await store.save(old)
+    let joins = await store.coordinator.observeRefreshJoins()
     let transport = try HTTPTransport(origin: server.origin).withSession(store)
     let first = Task { try await transport.invoke("notes.write", input: Payload(value: "same"), as: Payload.self) }
     let otherTransport = try HTTPTransport(origin: server.origin).withSession(store)
     let second = Task { try await otherTransport.invokePublic("notes.write", input: Payload(value: "same"), as: Payload.self) }
-    let joined = await waitForFlight(store.coordinator, count: 2, server: server)
+    let joined = await waitForFlight(joins, count: 2)
     await gate.open()
     let outputs = try await [first.value, second.value]
     #expect(joined)
@@ -761,10 +767,11 @@ private actor FailingStore: SessionStore {
     })
     let store = try MemoryStore(origin: server.origin)
     try await store.save(record(server.origin))
+    let joins = await store.coordinator.observeRefreshJoins()
     let transport = try HTTPTransport(origin: server.origin).withSession(store)
     let first = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
     let second = Task { try await transport.invoke("notes.write", input: Empty(), as: Payload.self) }
-    let joined = await waitForFlight(store.coordinator, count: 2, server: server)
+    let joined = await waitForFlight(joins, count: 2)
     #expect(joined)
     first.cancel()
     await expectFailure("canceled", status: nil) { _ = try await first.value }

@@ -38,6 +38,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         #endif
     }
     private var flights: [SessionCredential: Flight] = [:]
+    private var refreshJoins: AsyncStream<Int>.Continuation?
     private var uncertain: Set<SessionCredential> = []
     private var volatileSession: SessionRecord?
     private var volatileAuthGeneration: UInt64?
@@ -305,7 +306,11 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
     /// Creates the coordinator shared by every wrapper of one physical session record.
     public init() {}
 
-    var waitingCount: Int { flights.values.reduce(0) { $0 + $1.waiters.count } }
+    func observeRefreshJoins() -> AsyncStream<Int> {
+        let (stream, continuation) = AsyncStream.makeStream(of: Int.self, bufferingPolicy: .bufferingNewest(1))
+        refreshJoins = continuation
+        return stream
+    }
 
     private func commitRefresh(_ session: SessionRecord, expected: SessionRecord,
                                store: any SessionStore) async throws -> SessionCommit {
@@ -328,6 +333,7 @@ public actor SessionCoordinator: CustomStringConvertible, CustomDebugStringConve
         guard !Task.isCancelled else { throw ClientError(code: "cancelled", status: nil) }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                defer { refreshJoins?.yield(flights[key]?.waiters.count ?? 0) }
                 if flights[key] != nil {
                     flights[key]!.waiters[waiter] = continuation
                     #if CHICKINFRY_CONFORMANCE

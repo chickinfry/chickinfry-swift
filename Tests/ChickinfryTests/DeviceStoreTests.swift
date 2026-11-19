@@ -9,6 +9,13 @@ import Testing
 import Security
 #endif
 
+#if os(macOS)
+private let deviceFixtureParent = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+#else
+private let deviceFixtureParent = URL(fileURLWithPath: "/tmp", isDirectory: true)
+#endif
+private let deviceFixturePrefix = "chickinfry-swift-store-"
+
 private func launchDeviceProbe(root: URL, app: String, mode: String, origin: String = deviceOrigin) throws -> Process {
     guard ProcessInfo.processInfo.environment["CHICKINFRY_DEVICE_TEST_MODE"] == nil else { throw DeviceProbeFailure.check }
     let process = Process()
@@ -62,6 +69,12 @@ private func launchDeviceProbe(root: URL, app: String, mode: String, origin: Str
 }
 
 private enum DeviceProbeFailure: Error { case check }
+
+private actor DeviceCount {
+    var value = 0
+    func increment() { value += 1 }
+}
+
 private func probeCheck(_ condition: Bool) throws {
     guard condition else { throw DeviceProbeFailure.check }
 }
@@ -72,7 +85,7 @@ final class DeviceProcessProbe: XCTestCase, @unchecked Sendable {
         if let mode = environment["CHICKINFRY_DEVICE_TEST_MODE"] {
             let path = try #require(environment["CHICKINFRY_DEVICE_TEST_ROOT"])
             let app = try #require(environment["CHICKINFRY_DEVICE_TEST_APP"])
-            try #require(path.hasPrefix("/private/tmp/chickinfry-swift-store-"))
+            try #require(path.hasPrefix(deviceFixtureParent.appendingPathComponent(deviceFixturePrefix).path))
             try #require(app.hasPrefix("store-test-"))
             let root = URL(fileURLWithPath: path)
             if mode == "relative-directory" {
@@ -232,7 +245,7 @@ private func deviceRecord(origin: String = deviceOrigin) throws -> SessionRecord
 
 private func withDeviceFixture(_ body: (URL, String) async throws -> Void) async throws {
     let app = "store-test-" + UUID().uuidString.lowercased()
-    let root = URL(fileURLWithPath: "/private/tmp/chickinfry-swift-store-" + UUID().uuidString)
+    let root = deviceFixtureParent.appendingPathComponent(deviceFixturePrefix + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
                                            attributes: [.posixPermissions: 0o700])
     defer {
@@ -838,7 +851,7 @@ func deviceStorageErrorsKeepTheirCategory(code: String, expected: String) async 
 }
 
 @Test func deviceRejectsUnsafeLocationsAndSymbolicLinks() async throws {
-    for path in ["/private/tmp"] {
+    for path in [deviceFixtureParent.path] {
         await deviceFailure("failed_precondition") {
             let store = try DeviceSessionStore(origin: deviceOrigin, app: "unsafe", project: "project",
                                            environment: "test", persist: .dir(path),
@@ -945,11 +958,6 @@ func deviceInstallMarkerFailurePreservesOwnedCredentials(kind: String) async thr
         #expect(credentialsPreserved)
         #expect(markerPreserved)
     }
-}
-
-private actor DeviceCount {
-    var value = 0
-    func increment() { value += 1 }
 }
 
 @Test(arguments: [false, true])
