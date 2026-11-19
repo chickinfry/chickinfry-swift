@@ -4,18 +4,26 @@ import FoundationEssentials
 import Foundation
 #endif
 
-public struct RequestContext: Codable, Sendable {
-    public let method: String
-    public let uri: String
-    public let headers: [String: String]
+public struct Context: Codable, Sendable {
+    public struct Request: Codable, Sendable {
+        public let method: String
+        public let path: String
+        public let headers: [String: String]
+
+        public init(method: String, path: String, headers: [String: String]) {
+            self.method = method
+            self.path = path
+            self.headers = headers
+        }
+    }
+
+    public let request: Request
     var databaseHost: HostRequest? = nil
 
-    private enum CodingKeys: String, CodingKey { case method, uri, headers }
+    private enum CodingKeys: String, CodingKey { case request }
 
-    public init(method: String, uri: String, headers: [String: String]) {
-        self.method = method
-        self.uri = uri
-        self.headers = headers
+    public init(request: Request) {
+        self.request = request
     }
 
     public func log(level: String, message: String, fields: [String: LogValue]? = nil) async {
@@ -96,11 +104,11 @@ public struct ServerResponse: Sendable {
 
 public struct Operation: Sendable {
     let name: String
-    let invoke: @Sendable (JSONValue, RequestContext) async -> ServerResponse
+    let invoke: @Sendable (JSONValue, Context) async -> ServerResponse
 
     public init<Input: Decodable & Sendable, Output: Encodable & Sendable>(
         _ name: String, input: Input.Type,
-        handler: @escaping @Sendable (RequestContext, Input) async throws -> Output
+        handler: @escaping @Sendable (Context, Input) async throws -> Output
     ) {
         self.name = name
         invoke = { body, context in
@@ -136,9 +144,9 @@ public struct Application: Sendable {
         self.operations = Dictionary(uniqueKeysWithValues: operations.map { ($0.name, $0) })
     }
 
-    public func handle(_ operation: String, body: Data, context: RequestContext) async -> ServerResponse {
+    public func handle(_ operation: String, body: Data, context: Context) async -> ServerResponse {
         guard let target = operations[operation] else { return .failure("not_found", status: 404) }
-        guard context.method == "POST" else { return .failure("method_not_allowed", status: 405) }
+        guard context.request.method == "POST" else { return .failure("method_not_allowed", status: 405) }
         guard body.count <= 4 << 20 else { return .failure("request_too_large", status: 413) }
         do {
             let parsed = try JSONBody.parse(body)

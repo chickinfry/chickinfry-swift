@@ -61,7 +61,7 @@ private struct Harness: Sendable {
     var calls = h.calls.makeAsyncIterator()
     var results = h.results.makeAsyncIterator()
     try await h.runtime.start(1, rid: 17) {
-        var context = RequestContext(method: "POST", uri: "/probe.run", headers: [:])
+        var context = Context(request: .init(method: "POST", path: "/probe.run", headers: [:]))
         context.databaseHost = HostRequest.current
         await context.log(level: "invalid", message: "drop this")
         await context.log(level: "info", message: "drop this", fields: ["number": .number(.infinity)])
@@ -439,7 +439,7 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
 
 @Test func retainedAliasCannotStartIOFromAnUncancelledTask() async throws {
     let calls = AsyncStream<HostCall>.makeStream()
-    let aliases = AsyncStream<RequestContext>.makeStream()
+    let aliases = AsyncStream<Context>.makeStream()
     let gate = UncooperativeGate()
     let acknowledgements = AsyncStream<Void>.makeStream()
     let responses = AsyncStream<Void>.makeStream()
@@ -458,7 +458,7 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
         return Empty()
     }])
     try await runtime.start(1, rid: 71) {
-        await application.handle("capture", body: bytes("{}"), context: RequestContext(method: "POST", uri: "/capture", headers: [:]))
+        await application.handle("capture", body: bytes("{}"), context: Context(request: .init(method: "POST", path: "/capture", headers: [:])))
     }
     var iterator = aliases.stream.makeAsyncIterator()
     let alias = try #require(await iterator.next())
@@ -495,7 +495,7 @@ func crossChannelCommitErrorPreservesUncertainty(_ code: String) async throws {
     var calls = h.calls.makeAsyncIterator()
     var results = h.results.makeAsyncIterator()
     try await h.runtime.start(1, rid: 17) {
-        var context = RequestContext(method: "POST", uri: "/records", headers: [:])
+        var context = Context(request: .init(method: "POST", path: "/records", headers: [:]))
         context.databaseHost = HostRequest.current
         let repository = _Repository<Row>(_DatabaseConnection(context), table: "records", primaryKey: ["id"], columns: [
             _DatabaseColumn("id", kind: "id", nullable: false, optional: false),

@@ -216,8 +216,12 @@ func expectFailure(_ code: String, status: Int?,
     let invalid = ["not JSON: secret", "{}", "{\"value\":\"secret\"}", "{\"error\":\"\"}",
                    "{\"error\":null}", "{\"error\":123}", "{\"error\":\"Bad-Code123\"}",
                    "{\"error\":\"bad code\"}", "{\"error\":\"code\\n\"}", "[]"]
+    let descriptions: [(String, String?)] = [
+        ("", nil), (#","message":null"#, nil), (#","message":42"#, nil),
+        (#","message":"""#, ""), (#","message":"Public detail""#, "Public detail"),
+    ]
     let responses = invalid.map { PeerResponse.reply(503, Data($0.utf8)) }
-        + [.reply(409, Data("{\"error\":\"future_error_code\"}".utf8))]
+        + descriptions.map { .reply(409, Data(("{\"error\":\"future_error_code\"" + $0.0 + "}").utf8)) }
     try await withPeer(responses) { server in
         let transport = try HTTPTransport(origin: server.origin)
         for _ in invalid {
@@ -227,8 +231,16 @@ func expectFailure(_ code: String, status: Int?,
             #expect(error?.description.contains("secret") == false)
             #expect(error?.description.contains(server.origin) == false)
         }
-        await expectFailure("future_error_code", status: 409) {
-            let _: Payload = try await transport.invoke("notes.read", input: Empty())
+        for (_, expected) in descriptions {
+            do {
+                let _: Payload = try await transport.invoke("notes.read", input: Empty())
+                Issue.record("Expected a server rejection")
+            } catch let error as OperationError {
+                #expect(error.code == "future_error_code")
+                #expect(error.status == 409)
+                #expect(error.responseMessage == expected)
+                #expect(!error.description.contains("Public detail"))
+            }
         }
         #expect(await server.log.requests.count == responses.count)
     }

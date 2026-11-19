@@ -318,7 +318,7 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
             #if CHICKINFRY_CONFORMANCE
             observation?.confirmedOutcome()
             #endif
-            throw ServerRejection(error: OperationError(code: code!, status: status))
+            throw ServerRejection(error: OperationError(code: code!, status: status, responseMessage: envelope?.message))
         }
         let output: Output
         do {
@@ -445,7 +445,18 @@ private struct RefreshOutput: Decodable, Sendable {
 // Only a fully received and decoded server error envelope carries this provenance.
 struct ServerRejection: Error { let error: OperationError }
 
-private struct ErrorEnvelope: Decodable { let error: String }
+private struct ErrorEnvelope: Decodable {
+    let error: String
+    let message: String?
+
+    private enum CodingKeys: String, CodingKey { case error, message }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        error = try container.decode(String.self, forKey: .error)
+        message = try? container.decode(String.self, forKey: .message)
+    }
+}
 private final class ReceivedResponse: @unchecked Sendable {
     let body: Data
     let status: Int?

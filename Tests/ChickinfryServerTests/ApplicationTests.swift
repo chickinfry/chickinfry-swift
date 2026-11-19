@@ -33,7 +33,7 @@ private struct ObjectProbe: Decodable, Sendable {
         #expect(input.values == [1, 2])
         return Output(value: "ok")
     }])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/keys.inspect", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/keys.inspect", headers: [:]))
     for body in [#"{"é":1,"e\u0301":2}"#, #"{"\u00e9":1,"é":2}"#] {
         let response = await application.handle("keys.inspect", body: Data(body.utf8), context: context)
         #expect(response.status == 200)
@@ -130,7 +130,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
         Operation("echo.failed", input: Input.self) { _, _ -> Output in throw InternalFailure() },
         Operation("echo.databaseFailed", input: Input.self) { _, _ -> Output in throw HostFailure(code: "commit_unknown") },
     ])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/echo.call", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/echo.call", headers: [:]))
     let response = await application.handle("echo.call", body: Data(#"{"value":"한글 🐔"}"#.utf8), context: context)
     #expect(response.status == 200)
     #expect(try JSONDecoder().decode(Input.self, from: response.body).value == "한글 🐔")
@@ -154,7 +154,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
         if input.value == "slow" { try await Task.sleep(nanoseconds: 30_000_000) }
         return Output(value: input.value)
     }])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/echo.call", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/echo.call", headers: [:]))
     async let slow = application.handle("echo.call", body: Data(#"{"value":"slow"}"#.utf8), context: context)
     let fast = await application.handle("echo.call", body: Data(#"{"value":"fast"}"#.utf8), context: context)
     #expect(try JSONDecoder().decode(Input.self, from: fast.body).value == "fast")
@@ -174,7 +174,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
         await calls.record()
         return Output(value: "ok")
     }])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/items.get", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/items.get", headers: [:]))
     for body in [
         "{}",
         #"{"item_id":12,"private_marker":"never reflect"}"#,
@@ -209,7 +209,7 @@ private func rawNumbersMatchFoundation(_ token: String) throws {
             await calls.record(); return Output(value: "unexpected")
         },
     ])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/budget.call", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/budget.call", headers: [:]))
     for (operation, body, status, code) in [
         ("budget.call", "{}", 413, "request_too_large"),
         ("invalid.call", "{}", 400, "invalid_input"),
@@ -361,7 +361,7 @@ private func requestStructureRejectsBeforeHandler(_ name: String) async {
             await calls.record(); return Output(value: "ok")
         },
     ])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/\(test.operation)", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/\(test.operation)", headers: [:]))
     let response = await application.handle(test.operation, body: test.body, context: context)
     #expect(response.status == test.status)
     if let error = test.error {
@@ -382,7 +382,7 @@ private func malformedJSONSkipsHandler(_ body: String) async {
         Issue.record("Malformed JSON reached the handler")
         return Output(value: "unexpected")
     }])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/echo.call", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/echo.call", headers: [:]))
     let response = await application.handle("echo.call", body: Data(body.utf8), context: context)
     #expect(response.status == 400)
     #expect(response.body == Data(#"{"error":"invalid_json"}"#.utf8))
@@ -398,7 +398,7 @@ private func malformedJSONSkipsHandler(_ body: String) async {
         await calls.record()
         return Output(value: input.value)
     }])
-    let context = RequestContext(method: "POST", uri: "http://127.0.0.1/echo.call", headers: [:])
+    let context = Context(request: .init(method: "POST", path: "/echo.call", headers: [:]))
     var body = Data(#"{"value":"ok"}"#.utf8)
     body.append(Data(repeating: 32, count: (4 << 20) - body.count))
     let accepted = await application.handle("echo.call", body: body, context: context)
@@ -421,12 +421,12 @@ private func businessErrorsValidateAtResponseBoundary(_ status: Int) async {
     #expect(failure.fields.first?.path == "value")
     #expect(failure.fields.first?.code == "required")
     let application = Application(operations: [Operation("echo.call", input: Input.self) { context, input -> Output in
-        #expect(context.uri == "/echo.call")
+        #expect(context.request.path == "/echo.call")
         #expect(input.value == "received")
         throw failure
     }])
     let result = await application.handle("echo.call", body: Data(#"{"value":"received"}"#.utf8),
-                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+                                          context: Context(request: .init(method: "POST", path: "/echo.call", headers: [:])))
     let valid = (400...599).contains(status)
     #expect(result.status == (valid ? status : 500))
     #expect(result.body == Data((valid ? #"{"error":"x"}"# : #"{"error":"operation_failed"}"#).utf8))
@@ -438,7 +438,7 @@ private func businessErrorCodesMatchEntireASCIIString(_ code: String) async {
         throw OperationError(code: code, status: 422)
     }])
     let result = await application.handle("echo.call", body: Data(#"{"value":"ok"}"#.utf8),
-                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+                                          context: Context(request: .init(method: "POST", path: "/echo.call", headers: [:])))
     let valid = code == String(repeating: "_", count: 64)
     #expect(result.status == (valid ? 422 : 500))
     #expect(result.body == Data((valid ? "{\"error\":\"\(code)\"}" : #"{"error":"operation_failed"}"#).utf8))
@@ -452,7 +452,7 @@ private func businessErrorCodesMatchEntireASCIIString(_ code: String) async {
     }
     let application = Application(operations: [Operation("echo.call", input: Input.self) { _, _ in FailingOutput() }])
     let result = await application.handle("echo.call", body: Data(#"{"value":"ok"}"#.utf8),
-                                          context: RequestContext(method: "POST", uri: "/echo.call", headers: [:]))
+                                          context: Context(request: .init(method: "POST", path: "/echo.call", headers: [:])))
     #expect(result.status == 500)
     #expect(result.body == Data(#"{"error":"operation_failed"}"#.utf8))
 }

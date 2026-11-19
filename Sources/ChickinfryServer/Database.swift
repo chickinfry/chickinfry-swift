@@ -181,7 +181,7 @@ private func databaseTimestamp(_ text: String) throws -> String {
     private let lease: UInt64?
     private var open = true
 
-    public init(_ context: RequestContext) {
+    public init(_ context: Context) {
         self.host = context.databaseHost
         self.lease = nil
     }

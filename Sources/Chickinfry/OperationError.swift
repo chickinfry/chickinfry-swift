@@ -83,6 +83,7 @@ public struct ClientError: Error, Sendable, LocalizedError, CustomStringConverti
 public struct OperationError: Error, Sendable, LocalizedError, CustomStringConvertible {
     public let code: String
     public let status: Int?
+    public let responseMessage: String?
 
     public var errorDescription: String? { description }
     public var description: String {

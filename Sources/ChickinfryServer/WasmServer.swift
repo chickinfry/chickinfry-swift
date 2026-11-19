@@ -72,7 +72,7 @@ public enum WasmServer {
                               body: UnsafePointer<UInt8>, bodyCount: Int32) {
         struct Metadata: Decodable {
             let operation: String
-            let context: RequestContext
+            let context: Context
             let rid: UInt64?
             let deadlineMilliseconds: UInt64?
         }
