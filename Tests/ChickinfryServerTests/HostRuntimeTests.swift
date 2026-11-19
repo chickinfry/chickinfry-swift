@@ -84,6 +84,52 @@ private struct Harness: Sendable {
     #expect(await results.next()?.status == 200)
 }
 
+@Test func namedStorageUsesRequestHostAndPreservesBytesAndErrors() async throws {
+    let h = Harness()
+    var calls = h.calls.makeAsyncIterator()
+    var results = h.results.makeAsyncIterator()
+    try await h.runtime.start(1, rid: 30) {
+        var context = Context(request: .init(method: "POST", path: "/probe.run", headers: [:]))
+        context.databaseHost = HostRequest.current
+        let storage = context._storage("files")
+        try await storage.put("item", Data([0, 255, 1]), "application/octet-stream")
+        #expect(try await storage.get("item") == Data([0, 255, 1]))
+        #expect(try await storage.get("missing") == nil)
+        for (key, code, status) in [("denied", "operation_failed", 500), ("unbound", "service_unavailable", 503)] {
+            do {
+                _ = try await storage.get(key)
+                Issue.record("Storage read must fail")
+            } catch let error as OperationError {
+                #expect(error.code == code)
+                #expect(error.status == status)
+            }
+        }
+        return ok
+    }
+    let put = try #require(await calls.next())
+    #expect(put.channel == .storage)
+    #expect(try HostFrame.decode(put.bytes) == [
+        "rid": .integer(30), "op": .string("put"), "name": .string("files"), "key": .string("item"),
+        "bytes": .string("AP8B"), "contentType": .string("application/octet-stream"),
+    ])
+    await h.reply(put)
+    for (key, response) in [
+        ("item", #"{"value":"AP8B"}"#), ("missing", #"{"value":null}"#),
+        ("denied", #"{"error":"operation_failed"}"#), ("unbound", #"{"error":"service_unavailable"}"#),
+    ] {
+        let get = try #require(await calls.next())
+        #expect(get.channel == .storage)
+        #expect(try HostFrame.decode(get.bytes) == [
+            "rid": .integer(30), "op": .string("get"), "name": .string("files"), "key": .string(key),
+        ])
+        await h.reply(get, response)
+    }
+    let finish = try #require(await calls.next())
+    #expect(finish.channel == .finish)
+    await h.reply(finish)
+    #expect(await results.next()?.status == 200)
+}
+
 @Test func hostContinuationsAreOneShotAndRequestsStayIsolated() async throws {
     let h = Harness()
     var calls = h.calls.makeAsyncIterator()
@@ -167,6 +213,9 @@ private struct Harness: Sendable {
         catch is CancellationError {}
         await #expect(throws: CancellationError.self) {
             _ = try await host.database(bytes(#"{"op":"query","sql":"forbidden","params":[]}"#))
+        }
+        await #expect(throws: CancellationError.self) {
+            _ = try await Storage(name: "files", host: host).get("forbidden")
         }
         await gate.wait()
         return ok

@@ -48,7 +48,7 @@ struct HostFailure: Error, Sendable {
     static let transport = HostFailure(code: "database_failed")
 }
 
-enum HostChannel: Int32, Sendable { case database = 0, environment = 1, log = 2, finish = 3 }
+enum HostChannel: Int32, Sendable { case database = 0, environment = 1, log = 2, finish = 3, storage = 4 }
 
 enum HostFrame {
     static func decode(_ data: Data) throws -> [String: HostValue] {
@@ -146,6 +146,18 @@ enum HostFrame {
                 guard case .object = value else { throw HostFailure.invalidFrame }
                 fields = ["level", "message", "fields"]
             } else { fields = ["level", "message"] }
+        case .storage:
+            guard case .string(let op) = frame["op"], case .string = frame["name"], case .string = frame["key"] else {
+                throw HostFailure.invalidFrame
+            }
+            operation = op
+            switch op {
+            case "get": fields = ["op", "name", "key"]
+            case "put":
+                guard case .string = frame["bytes"], case .string = frame["contentType"] else { throw HostFailure.invalidFrame }
+                fields = ["op", "name", "key", "bytes", "contentType"]
+            default: throw HostFailure.invalidFrame
+            }
         case .finish: throw HostFailure.invalidFrame
         }
         guard Set(frame.keys) == fields else { throw HostFailure.invalidFrame }
@@ -163,6 +175,7 @@ enum HostFrame {
                 allowed = ["database_failed", "commit_unknown", "invalid_host_call"].contains(code)
                     || (code.utf8.count == 5 && code.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) }))
             case "env": allowed = ["binding_unavailable", "invalid_host_call"].contains(code)
+            case "get", "put": allowed = ["service_unavailable", "operation_failed"].contains(code)
             case "log": allowed = ["log_failed", "invalid_host_call"].contains(code)
             default: allowed = false
             }
@@ -175,7 +188,7 @@ enum HostFrame {
                   rows.allSatisfy({ if case .object = $0 { true } else { false } }) else { throw HostFailure.invalidFrame }
         case "begin":
             guard frame.count == 1, frame["lease"]?.handle != nil else { throw HostFailure.invalidFrame }
-        case "env":
+        case "env", "get":
             guard frame.count == 1, let value = frame["value"], value == .null || { if case .string = value { true } else { false } }() else {
                 throw HostFailure.invalidFrame
             }

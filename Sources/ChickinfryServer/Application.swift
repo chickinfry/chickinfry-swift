@@ -30,6 +30,10 @@ public struct Context: Codable, Sendable {
         await databaseHost?.log(level: level, message: message, fields: fields)
     }
 
+    @_spi(Generated) public func _storage(_ name: String) -> Storage {
+        Storage(name: name, host: databaseHost)
+    }
+
     @_spi(Generated) public func _secret(_ name: String) async throws -> String {
         guard let host = databaseHost, let bytes = try? await host.environment(name),
               let frame = try? HostFrame.decode(bytes), case .string(let value) = frame["value"], !value.isEmpty else {

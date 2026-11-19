@@ -24,6 +24,10 @@ import Foundation
         try await runtime.perform(invocation, channel: .environment, bytes: HostFrame.encode(["name": .string(name)]))
     }
 
+    func storage(_ frame: [String: HostValue]) async throws -> Data {
+        try await runtime.perform(invocation, channel: .storage, bytes: HostFrame.encode(frame))
+    }
+
     public func log(level: String, message: String, fields: [String: LogValue]? = nil) async {
         struct Record: Encodable {
             let level: String
