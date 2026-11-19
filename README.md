@@ -2,7 +2,8 @@
 
 This package is under development and is not marked as supported until verification is complete.
 
-The Swift SDK targets iOS, macOS, tvOS, watchOS, and visionOS.
+The Swift SDK targets iOS, macOS, tvOS, watchOS, visionOS, and Linux.
+Apple platforms use the OS transport and are unaffected by the `ClientTransport` trait. Server-only builds disable it.
 
 ## Installation
 

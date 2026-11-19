@@ -3,6 +3,10 @@ import Foundation
 struct CallDeadline: Sendable {
     private let end: UInt64
 
+    #if os(Linux)
+    var uptimeNanoseconds: UInt64 { end }
+    #endif
+
     init(timeout: TimeInterval) {
         end = DispatchTime.now().uptimeNanoseconds + UInt64(timeout * 1_000_000_000)
     }

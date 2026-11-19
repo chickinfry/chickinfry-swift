@@ -32,6 +32,7 @@ actor PeerLog {
     private let responder: (@Sendable (PeerRequest) -> PeerResponse)?
     private(set) var requests: [PeerRequest] = []
     private(set) var completions: [PeerCompletion] = []
+    private(set) var tlsBytes = 0
     private(set) var stopped = false
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var requestWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -58,6 +59,11 @@ actor PeerLog {
         for (_, continuation) in ready { continuation.resume() }
     }
 
+    func completeTLS(received: Int, disconnected: Bool) {
+        tlsBytes += received
+        complete(sent: 0, disconnected: disconnected)
+    }
+
     func waitForCompletions(_ count: Int) async {
         if completions.count >= count { return }
         await withCheckedContinuation { waiters.append((count, $0)) }
@@ -78,7 +84,8 @@ final class LoopbackServer: Sendable {
     private let port: UInt16
     private let worker: Task<Void, Never>
 
-    init(_ responses: [PeerResponse] = [], responder: (@Sendable (PeerRequest) -> PeerResponse)? = nil) throws {
+    init(_ responses: [PeerResponse] = [], stallTLS: PeerGate? = nil,
+         responder: (@Sendable (PeerRequest) -> PeerResponse)? = nil) throws {
         #if canImport(Darwin)
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         #else
@@ -130,6 +137,26 @@ final class LoopbackServer: Sendable {
                         var receiveTimeout = timeval(tv_sec: 5, tv_usec: 0)
                         _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout,
                                        socklen_t(MemoryLayout<timeval>.size))
+                        if let stallTLS {
+                            let (received, disconnected) = await withCheckedContinuation { continuation in
+                                DispatchQueue.global().async {
+                                    var buffer = [UInt8](repeating: 0, count: 4096)
+                                    var received = 0
+                                    var count: Int
+                                    repeat {
+                                        count = recv(client, &buffer, buffer.count, 0)
+                                        if count > 0 {
+                                            if received == 0 { Task { await stallTLS.open() } }
+                                            received += count
+                                        }
+                                    } while count > 0 || (count < 0 && errno == EINTR)
+                                    continuation.resume(returning: (received, count == 0 || errno == ECONNRESET))
+                                }
+                            }
+                            await log.completeTLS(received: received, disconnected: disconnected)
+                            close(client)
+                            return
+                        }
                         let request = await withCheckedContinuation { continuation in
                             DispatchQueue.global().async {
                                 continuation.resume(returning: Self.readRequest(client))

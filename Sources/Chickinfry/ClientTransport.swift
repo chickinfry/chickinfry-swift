@@ -2,6 +2,14 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if os(Linux) && ClientTransport
+import AsyncHTTPClient
+import NIOCore
+import NIOHTTP1
+import NIOHTTPCompression
+#elseif !canImport(Darwin)
+#error("ClientTransport trait is required on this platform")
+#endif
 
 /// The JSON operation boundary used by generated clients.
 public protocol Transport: Sendable {
@@ -267,6 +275,9 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
         let observation = Conformance.call
         observation?.exchange(immediate: finalExchange)
         #endif
+        #if os(Linux) && ClientTransport
+        let response = try await Self.exchangeLinux(url: url, body: body, bearer: bearer, deadline: deadline)
+        #else
         let remaining = try deadline.remaining()
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -296,6 +307,7 @@ public struct HTTPTransport: Transport, CustomStringConvertible, CustomDebugStri
         } onCancel: {
             receiver.fail(code: "cancelled")
         }
+        #endif
         guard let status = response.status else {
             throw ClientError(code: "invalid_response", status: nil)
         }
@@ -471,6 +483,133 @@ private final class ReceivedResponse: @unchecked Sendable {
         self.status = status
     }
 }
+
+#if os(Linux) && ClientTransport
+extension HTTPTransport {
+    @TaskLocal static var inspectLinuxResponseBuffer: (@Sendable (Int) -> Void)?
+
+    private static func exchangeLinux(url: URL, body: Data, bearer: String?,
+                                      deadline: CallDeadline) async throws -> ReceivedResponse {
+        _ = try deadline.remaining()
+        var headers = HTTPHeaders([("Content-Type", "application/json")])
+        if let bearer { headers.add(name: "Authorization", value: "Bearer " + bearer) }
+        let request: HTTPClient.Request
+        do {
+            request = try HTTPClient.Request(url: url, method: .POST, headers: headers, body: .bytes(body))
+        } catch {
+            throw ClientError(code: "invalid_request", status: nil)
+        }
+        let remaining = try deadline.remaining()
+        // A pool can continue opening a connection after its queued request expires.
+        var configuration = HTTPClient.Configuration(
+            redirectConfiguration: .disallow,
+            timeout: .init(connect: .nanoseconds(Int64(remaining * 1_000_000_000))),
+            decompression: .enabled(limit: .size(LinuxResponseReceiver.limit))
+        )
+        configuration.connectionPool.retryConnectionEstablishment = false
+        let client = HTTPClient(configuration: configuration)
+        let receiver = LinuxResponseReceiver(inspect: inspectLinuxResponseBuffer)
+        let result: Result<ReceivedResponse, ClientError>
+        do {
+            let response = try await withTaskCancellationHandler {
+                let task = try receiver.submit {
+                    _ = try deadline.remaining()
+                    return client.execute(request: request, delegate: receiver,
+                                          deadline: .uptimeNanoseconds(deadline.uptimeNanoseconds))
+                }
+                return try await task.futureResult.get()
+            } onCancel: {
+                receiver.cancel()
+            }
+            result = .success(response)
+        } catch let error as ClientError {
+            result = .failure(error)
+        } catch {
+            let reason: String
+            switch (error as? HTTPClientError, error as? NIOHTTPDecompression.DecompressionError) {
+            case (.deadlineExceeded, _), (.connectTimeout, _), (.readTimeout, _), (.writeTimeout, _):
+                reason = "timeout"
+            case (.cancelled, _):
+                reason = "cancelled"
+            case (_, .limit):
+                reason = "response_too_large"
+            default:
+                if Task.isCancelled {
+                    reason = "cancelled"
+                } else if DispatchTime.now().uptimeNanoseconds >= deadline.uptimeNanoseconds {
+                    reason = "timeout"
+                } else {
+                    reason = "transport_error"
+                }
+            }
+            result = .failure(ClientError(code: reason, status: receiver.status))
+        }
+        receiver.releaseTask()
+        // An in-flight connection may need its own deadline to finish closing.
+        client.shutdown { [client] _ in withExtendedLifetime(client) {} }
+        return try result.get()
+    }
+}
+
+// The delegate receives response parts serially. Status is read after its future is resolved.
+private final class LinuxResponseReceiver: HTTPClientResponseDelegate, @unchecked Sendable {
+    static let limit = 1024 * 1024
+    private let inspect: (@Sendable (Int) -> Void)?
+    private let submissionLock = NSLock()
+    private var task: HTTPClient.Task<ReceivedResponse>?
+    private var cancelled = false
+    private(set) var status: Int?
+    private var body = Data()
+
+    init(inspect: (@Sendable (Int) -> Void)?) {
+        self.inspect = inspect
+    }
+
+    func submit(_ start: () throws -> HTTPClient.Task<ReceivedResponse>) throws -> HTTPClient.Task<ReceivedResponse> {
+        try submissionLock.withLock {
+            guard !cancelled, !Task.isCancelled else { throw ClientError(code: "cancelled", status: nil) }
+            let task = try start()
+            self.task = task
+            return task
+        }
+    }
+
+    func cancel() {
+        let task = submissionLock.withLock {
+            cancelled = true
+            return self.task
+        }
+        task?.cancel()
+    }
+
+    func releaseTask() {
+        submissionLock.withLock { task = nil }
+    }
+
+    func didReceiveHead(task: HTTPClient.Task<ReceivedResponse>, _ head: HTTPResponseHead) -> EventLoopFuture<Void> {
+        let code = Int(head.status.code)
+        status = code
+        inspect?(body.count)
+        if (300..<400).contains(code) {
+            return task.eventLoop.makeFailedFuture(ClientError(code: "invalid_response", status: code))
+        }
+        return task.eventLoop.makeSucceededFuture(())
+    }
+
+    func didReceiveBodyPart(task: HTTPClient.Task<ReceivedResponse>, _ buffer: ByteBuffer) -> EventLoopFuture<Void> {
+        guard buffer.readableBytes <= Self.limit - body.count else {
+            return task.eventLoop.makeFailedFuture(ClientError(code: "response_too_large", status: status))
+        }
+        body.append(contentsOf: buffer.readableBytesView)
+        inspect?(body.count)
+        return task.eventLoop.makeSucceededFuture(())
+    }
+
+    func didFinishRequest(task: HTTPClient.Task<ReceivedResponse>) throws -> ReceivedResponse {
+        ReceivedResponse(body: body, status: status)
+    }
+}
+#endif
 
 // All delegate, cancellation, and deadline state is protected by the same lock.
 private final class ResponseReceiver: NSObject, URLSessionDataDelegate, @unchecked Sendable {

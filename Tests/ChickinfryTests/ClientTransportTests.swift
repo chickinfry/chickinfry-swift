@@ -169,8 +169,6 @@ func expectFailure(_ code: String, status: Int?,
     }
 }
 
-#if canImport(Darwin)
-// The SDK does not support Linux FoundationNetworking, which buffers 301 bodies and can crash on the redirect callback.
 @Test func everyRedirectIsRejectedWithoutForwardingBearer() async throws {
     try await withPeer { destination in
         let statuses = Array(301...308)
@@ -191,7 +189,6 @@ func expectFailure(_ code: String, status: Int?,
     }
 }
 
-// The header-status assertion requires Apple URLSession; FoundationNetworking on Linux is outside SDK support.
 @Test(arguments: [false, true]) func deadlineCancelsSilentAndTricklingPeers(headers: Bool) async throws {
     let reply = PeerGate()
     try await withPeer([.stall(headers), .gatedReply(200, validBody, reply)]) { server in
@@ -215,6 +212,31 @@ func expectFailure(_ code: String, status: Int?,
     }
 }
 
+#if os(Linux)
+@Test(arguments: [false, true]) func stalledTLSClosesAtTheCallDeadline(cancel: Bool) async throws {
+    let hello = PeerGate()
+    let server = try LoopbackServer(stallTLS: hello)
+    let origin = server.origin.replacingOccurrences(of: "http://", with: "https://")
+    let transport = try HTTPTransport(origin: origin, timeout: cancel ? 3 : 1)
+    let call = Task { try await transport.invoke("notes.read", input: Empty(), as: Payload.self) }
+    if cancel {
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(5))
+            await hello.open()
+        }
+        await hello.wait()
+        watchdog.cancel()
+        let canceledAt = ContinuousClock.now
+        call.cancel()
+        await expectFailure("canceled", status: nil) { _ = try await call.value }
+        #expect(canceledAt.duration(to: .now) < .seconds(1))
+    } else {
+        await expectFailure("deadline_exceeded", status: nil) { _ = try await call.value }
+    }
+    await server.stop()
+    #expect(await server.log.tlsBytes > 0)
+    #expect(await server.log.completions.first?.disconnected == true)
+}
 #endif
 
 @Test func errorEnvelopeClassificationAndRedaction() async throws {
