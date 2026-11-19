@@ -6,6 +6,10 @@ import Foundation
 
 public struct DatabaseError: Error, Sendable {
     public let code: String
+    public var message: String {
+        code == "commit_unknown" ? "Transaction commit outcome is unknown." : "Database operation failed."
+    }
+
     init(_ code: String) { self.code = code }
 }
 

@@ -57,6 +57,7 @@ public enum WasmServer {
     }
 
     public static func start(_ application: Application, setup: @escaping @Sendable () async throws -> ApplicationOptions) {
+        guard chik_prepare_stdio() == 0 else { chik_settle(0, 500, nil, 0); return }
         installWasmExecutors()
         Task {
             do {
@@ -114,6 +115,10 @@ public enum WasmServer {
 public func chikAllocate(_ count: Int32) -> UnsafeMutablePointer<UInt8> {
     .allocate(capacity: max(1, Int(count)))
 }
+
+@_cdecl("chik_log_request")
+@_spi(Generated)
+public func chikLogRequest() -> UInt64 { HostRequest.current?.rid ?? 0 }
 
 @_cdecl("chik_deallocate")
 public func chikDeallocate(_ pointer: UnsafeMutablePointer<UInt8>) { pointer.deallocate() }

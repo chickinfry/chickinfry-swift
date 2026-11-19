@@ -8,10 +8,12 @@ import Foundation
     @TaskLocal public static var current: HostRequest?
     private let runtime: HostRuntime
     private let invocation: Int32
+    let rid: UInt64
 
-    fileprivate init(runtime: HostRuntime, invocation: Int32) {
+    fileprivate init(runtime: HostRuntime, invocation: Int32, rid: UInt64) {
         self.runtime = runtime
         self.invocation = invocation
+        self.rid = rid
     }
 
     public func database(_ frame: Data) async throws -> Data {
@@ -22,9 +24,16 @@ import Foundation
         try await runtime.perform(invocation, channel: .environment, bytes: HostFrame.encode(["name": .string(name)]))
     }
 
-    public func log(level: String, message: String) async throws {
-        _ = try await runtime.perform(invocation, channel: .log,
-                                      bytes: HostFrame.encode(["level": .string(level), "message": .string(message)]))
+    public func log(level: String, message: String, fields: [String: LogValue]? = nil) async {
+        struct Record: Encodable {
+            let level: String
+            let message: String
+            let fields: [String: LogValue]?
+        }
+        guard ["debug", "info", "warn", "error"].contains(level),
+              let bytes = try? JSONEncoder().encode(Record(level: level, message: message, fields: fields)),
+              bytes.count <= 4 << 20 else { return }
+        _ = try? await runtime.perform(invocation, channel: .log, bytes: bytes)
     }
 }
 
@@ -84,7 +93,7 @@ actor HostRuntime {
               !requests.values.contains(where: { $0.rid == rid }) else { throw HostFailure.invalidFrame }
         lastInvocation = invocation
         requests[invocation] = Request(rid: rid)
-        let host = HostRequest(runtime: self, invocation: invocation)
+        let host = HostRequest(runtime: self, invocation: invocation, rid: rid)
         requests[invocation]?.task = Task {
             let response: ServerResponse
             do {
@@ -121,7 +130,7 @@ actor HostRuntime {
                 } catch { continuation.resume(throwing: error) }
             }
         } onCancel: {
-            Task { await self.cancel(invocation) }
+            if channel != .log { Task { await self.cancel(invocation) } }
         }
     }
 
@@ -180,6 +189,10 @@ actor HostRuntime {
             if let code { value.continuation?.resume(throwing: HostFailure(code: code)) }
             else { value.continuation?.resume(returning: bytes) }
         } catch {
+            if value.operation == "log" {
+                value.continuation?.resume(throwing: error)
+                return
+            }
             classifyInterruptedCommit(value, state: &request.state)
             if value.operation == "begin" || value.operation == "rollback" { request.state.transaction = .discarded }
             requests[value.invocation] = request
@@ -223,6 +236,10 @@ actor HostRuntime {
 
     private func taskCompleted(_ invocation: Int32, response: ServerResponse) {
         guard var request = requests[invocation] else { return }
+        for (call, value) in pending where value.invocation == invocation && value.operation == "log" {
+            pending.removeValue(forKey: call)
+            value.continuation?.resume(throwing: CancellationError())
+        }
         let hasPendingCalls = pending.values.contains(where: { $0.invocation == invocation })
         request.response = request.state.phase == .stopping || hasPendingCalls ? .failure("operation_failed", status: 500) : response
         request.task = nil

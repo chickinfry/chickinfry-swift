@@ -139,9 +139,13 @@ enum HostFrame {
             operation = "env"; fields = ["name"]
             guard case .string = frame["name"] else { throw HostFailure.invalidFrame }
         case .log:
-            operation = "log"; fields = ["level", "message"]
+            operation = "log"
             guard case .string(let level) = frame["level"], ["debug", "info", "warn", "error"].contains(level),
                   case .string = frame["message"] else { throw HostFailure.invalidFrame }
+            if let value = frame["fields"] {
+                guard case .object = value else { throw HostFailure.invalidFrame }
+                fields = ["level", "message", "fields"]
+            } else { fields = ["level", "message"] }
         case .finish: throw HostFailure.invalidFrame
         }
         guard Set(frame.keys) == fields else { throw HostFailure.invalidFrame }

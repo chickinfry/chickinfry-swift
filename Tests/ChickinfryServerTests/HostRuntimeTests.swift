@@ -9,6 +9,13 @@ import Testing
 private let ok = ServerResponse(status: 200, body: Data("{}".utf8))
 private func bytes(_ value: String) -> Data { Data(value.utf8) }
 
+@Test func databaseErrorsExposeCodeAndNeutralMessage() {
+    let duplicate = DatabaseError("23505")
+    #expect(duplicate.code == "23505")
+    #expect(duplicate.message == "Database operation failed.")
+    #expect(DatabaseError("commit_unknown").message == "Transaction commit outcome is unknown.")
+}
+
 private actor UncooperativeGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private var opened = false
@@ -47,6 +54,34 @@ private struct Harness: Sendable {
     func reply(_ call: HostCall, _ value: String = "{}", success: Bool = true) async {
         await runtime.receive(call.id, succeeded: success, bytes: bytes(value))
     }
+}
+
+@Test func contextLogFailureDoesNotStopRequest() async throws {
+    let h = Harness()
+    var calls = h.calls.makeAsyncIterator()
+    var results = h.results.makeAsyncIterator()
+    try await h.runtime.start(1, rid: 17) {
+        var context = RequestContext(method: "POST", uri: "/probe.run", headers: [:])
+        context.databaseHost = HostRequest.current
+        await context.log(level: "invalid", message: "drop this")
+        await context.log(level: "info", message: "drop this", fields: ["number": .number(.infinity)])
+        await context.log(level: "warn", message: "first", fields: ["key": .array([.integer(9), .null])])
+        await context.log(level: "info", message: "second")
+        return ok
+    }
+    let first = try #require(await calls.next())
+    #expect(first.channel == .log)
+    #expect(try HostFrame.decode(first.bytes) == ["rid": .integer(17), "level": .string("warn"), "message": .string("first"),
+                                                 "fields": .object(["key": .array([.integer(9), .null])])])
+    await h.reply(first, "", success: false)
+    let second = try #require(await calls.next())
+    #expect(second.channel == .log)
+    #expect(try HostFrame.decode(second.bytes) == ["rid": .integer(17), "level": .string("info"), "message": .string("second")])
+    await h.reply(second, #"{"error":"log_failed"}"#)
+    let finish = try #require(await calls.next())
+    #expect(try HostFrame.decode(finish.bytes)["cancel"] == .bool(false))
+    await h.reply(finish)
+    #expect(await results.next()?.status == 200)
 }
 
 @Test func hostContinuationsAreOneShotAndRequestsStayIsolated() async throws {

@@ -17,6 +17,37 @@ public struct RequestContext: Codable, Sendable {
         self.uri = uri
         self.headers = headers
     }
+
+    public func log(level: String, message: String, fields: [String: LogValue]? = nil) async {
+        await databaseHost?.log(level: level, message: message, fields: fields)
+    }
+
+    @_spi(Generated) public func _secret(_ name: String) async throws -> String {
+        guard let host = databaseHost, let bytes = try? await host.environment(name),
+              let frame = try? HostFrame.decode(bytes), case .string(let value) = frame["value"], !value.isEmpty else {
+            throw OperationError(code: "service_unavailable", status: 503)
+        }
+        return value
+    }
+}
+
+public enum LogValue: Encodable, Sendable {
+    case null, bool(Bool), integer(Int64), number(Double), string(String)
+    case array([LogValue]), object([String: LogValue])
+
+    public func encode(to encoder: any Encoder) throws {
+        guard encoder.codingPath.count <= 64 else { throw HostFailure.invalidFrame }
+        var value = encoder.singleValueContainer()
+        switch self {
+        case .null: try value.encodeNil()
+        case .bool(let flag): try value.encode(flag)
+        case .integer(let integer): try value.encode(integer)
+        case .number(let number): try value.encode(number)
+        case .string(let string): try value.encode(string)
+        case .array(let array): try value.encode(array)
+        case .object(let object): try value.encode(object)
+        }
+    }
 }
 
 public struct ApplicationOptions: Sendable {

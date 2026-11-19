@@ -33,7 +33,7 @@ private actor SetupState {
 
 @_cdecl("probe_boot")
 public func probeBoot() {
-    WasmServer.start(Application(operations: [Operation("probe.run", input: Input.self) { _, input in
+    WasmServer.start(Application(operations: [Operation("probe.run", input: Input.self) { context, input in
         var value = input.value
         switch input.mode {
         case "legacy": try await Task.sleep(nanoseconds: 30_000_000)
@@ -46,7 +46,7 @@ public func probeBoot() {
         case "env":
             guard let host = HostRequest.current else { throw OperationError.notImplemented }
             value = try JSONDecoder().decode(Environment.self, from: await host.environment("probe")).value
-            try await host.log(level: "info", message: "Probe log")
+            await context.log(level: "info", message: "Probe log")
         case "transaction":
             guard let host = HostRequest.current else { throw OperationError.notImplemented }
             let lease = try JSONDecoder().decode(Lease.self, from: await host.database(Data(#"{"op":"begin"}"#.utf8))).lease
