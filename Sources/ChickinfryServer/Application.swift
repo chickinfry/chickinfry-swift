@@ -89,7 +89,19 @@ public struct OperationError: Error, Sendable {
         self.fields = fields
     }
 
+    // BEGIN generated operation errors
+
+    public static let notFound = OperationError(code: "not_found", status: 404)
+
+    public static let invalidInput = OperationError(code: "invalid_input", status: 400)
+
+    public static let conflict = OperationError(code: "conflict", status: 409)
+
+    public static let forbidden = OperationError(code: "forbidden", status: 403)
+
     public static let notImplemented = OperationError(code: "not_implemented", status: 501)
+
+    // END generated operation errors
 }
 
 @_spi(Generated)
