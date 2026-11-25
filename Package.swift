@@ -4,9 +4,9 @@ import PackageDescription
 #if os(Linux)
 let defaultTraits: Set<String> = ["ClientTransport"]
 let clientPackages: [Package.Dependency] = [
-    .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.37.0"),
-    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.105.0"),
-    .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.6"),
+    .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.37.1"),
+    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.105.2"),
+    .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.7"),
 ]
 let clientProducts: [Target.Dependency] = [
     .product(name: "AsyncHTTPClient", package: "async-http-client", condition: .when(traits: ["ClientTransport"])),
